@@ -1,0 +1,47 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Project {
+  id        String    @id @default(cuid())
+  name      String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  artifacts Artifact[]
+}
+
+model Artifact {
+  id                String           @id @default(cuid())
+  projectId         String
+  type              String
+  name              String
+  schemaVersion     Int
+  currentRevisionId String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  project   Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  revisions ArtifactRevision[]
+
+  @@unique([projectId, type, name])
+  @@index([projectId, type])
+}
+
+model ArtifactRevision {
+  id             String   @id @default(cuid())
+  artifactId     String
+  revisionNumber Int
+  payload        Json
+  createdAt      DateTime @default(now())
+
+  artifact Artifact @relation(fields: [artifactId], references: [id], onDelete: Cascade)
+
+  @@unique([artifactId, revisionNumber])
+  @@index([artifactId, createdAt])
+}
