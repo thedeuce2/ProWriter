@@ -24,6 +24,8 @@ import {
   getArtifactRevision
 } from "./artifacts.js";
 
+const DEFAULT_PROJECT_NAME = "default";
+
 function badRequest(message: string): never {
   const err = new Error(message);
   // @ts-expect-error fastify reads statusCode
@@ -37,8 +39,26 @@ function asArtifactType(s: string): ArtifactType {
   return parsed.data;
 }
 
+async function getOrCreateDefaultProjectId(): Promise<string> {
+  const existing = await prisma.project.findFirst({
+    where: { name: DEFAULT_PROJECT_NAME }
+  });
+  if (existing) return existing.id;
+
+  const created = await prisma.project.create({
+    data: { name: DEFAULT_PROJECT_NAME }
+  });
+  return created.id;
+}
+
 export async function registerRoutes(app: FastifyInstance) {
   app.get("/health", async () => ({ ok: true }));
+
+  app.get("/", async () => ({
+    ok: true,
+    service: "prowriter-backend",
+    endpoints: ["/health", "/openapi.yaml"]
+  }));
 
   app.get("/openapi.yaml", async (_req, reply) => {
     const p = path.join(process.cwd(), "openapi.yaml");
@@ -46,34 +66,12 @@ export async function registerRoutes(app: FastifyInstance) {
     reply.type("text/yaml").send(yml);
   });
 
-  // Projects
-  app.post("/v1/projects", async (req) => {
-    const parsed = ProjectCreateSchema.safeParse(req.body ?? {});
-    const data = parsed.success ? parsed.data : badRequest("Invalid project request");
+  // -------------------------
+  // Default-project routes (NO projectId required)
+  // -------------------------
 
-    const created = await prisma.project.create({
-      data: { name: data.name ?? null }
-    });
-
-    return { project_id: created.id };
-  });
-
-  app.get("/v1/projects", async () => {
-    const projects = await prisma.project.findMany({ orderBy: { updatedAt: "desc" } });
-    return {
-      projects: projects.map((p) => ({
-        project_id: p.id,
-        name: p.name,
-        created_at: p.createdAt,
-        updated_at: p.updatedAt
-      }))
-    };
-  });
-
-  // Canon digest (lightweight, deterministic)
-  app.get("/v1/projects/:projectId/canon-digest", async (req) => {
-    const { projectId } = req.params as { projectId: string };
-
+  app.get("/v1/canon-digest", async () => {
+    const projectId = await getOrCreateDefaultProjectId();
     const artifacts = await listArtifacts(projectId);
 
     return {
@@ -84,44 +82,35 @@ export async function registerRoutes(app: FastifyInstance) {
     };
   });
 
-  // Generic artifact endpoints
-  app.get("/v1/projects/:projectId/artifacts", async (req) => {
-    const { projectId } = req.params as { projectId: string };
+  app.get("/v1/artifacts", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
     const q = req.query as { type?: string };
 
     const type = q.type ? asArtifactType(q.type) : undefined;
     return { artifacts: await listArtifacts(projectId, type) };
   });
 
-  app.put("/v1/projects/:projectId/artifacts/:type/:name", async (req) => {
-    const { projectId, type, name } = req.params as {
-      projectId: string;
-      type: string;
-      name: string;
-    };
+  app.put("/v1/artifacts/:type/:name", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
+    const { type, name } = req.params as { type: string; name: string };
 
     const artifactType = asArtifactType(type);
 
     const parsedBody = ArtifactUpsertSchema.safeParse(req.body);
     const body = parsedBody.success ? parsedBody.data : badRequest("Invalid artifact upsert body");
 
-    const result = await upsertArtifact({
+    return upsertArtifact({
       projectId,
       type: artifactType,
       name,
       schemaVersion: body.schema_version,
       payload: body.payload
     });
-
-    return result;
   });
 
-  app.get("/v1/projects/:projectId/artifacts/:type/:name", async (req) => {
-    const { projectId, type, name } = req.params as {
-      projectId: string;
-      type: string;
-      name: string;
-    };
+  app.get("/v1/artifacts/:type/:name", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
+    const { type, name } = req.params as { type: string; name: string };
 
     const artifactType = asArtifactType(type);
 
@@ -130,12 +119,9 @@ export async function registerRoutes(app: FastifyInstance) {
     return latest;
   });
 
-  app.get("/v1/projects/:projectId/artifacts/:type/:name/revisions", async (req) => {
-    const { projectId, type, name } = req.params as {
-      projectId: string;
-      type: string;
-      name: string;
-    };
+  app.get("/v1/artifacts/:type/:name/revisions", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
+    const { type, name } = req.params as { type: string; name: string };
 
     const artifactType = asArtifactType(type);
 
@@ -144,9 +130,9 @@ export async function registerRoutes(app: FastifyInstance) {
     return { revisions: list };
   });
 
-  app.get("/v1/projects/:projectId/artifacts/:type/:name/revisions/:revision", async (req) => {
-    const { projectId, type, name, revision } = req.params as {
-      projectId: string;
+  app.get("/v1/artifacts/:type/:name/revisions/:revision", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
+    const { type, name, revision } = req.params as {
       type: string;
       name: string;
       revision: string;
@@ -168,10 +154,9 @@ export async function registerRoutes(app: FastifyInstance) {
     return item;
   });
 
-  // Typed convenience endpoints (stable operationIds for Actions)
-
-  app.put("/v1/projects/:projectId/style-profiles/:name", async (req) => {
-    const { projectId, name } = req.params as { projectId: string; name: string };
+  app.put("/v1/style-profiles/:profileName", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
+    const { profileName } = req.params as { profileName: string };
 
     const parsed = StyleProfileSchema.safeParse(req.body);
     const data = parsed.success ? parsed.data : badRequest("Invalid style profile");
@@ -179,21 +164,24 @@ export async function registerRoutes(app: FastifyInstance) {
     return upsertArtifact({
       projectId,
       type: "style_profile",
-      name,
+      name: profileName,
       schemaVersion: data.schema_version,
       payload: data
     });
   });
 
-  app.get("/v1/projects/:projectId/style-profiles/:name", async (req) => {
-    const { projectId, name } = req.params as { projectId: string; name: string };
-    const latest = await getArtifactLatest({ projectId, type: "style_profile", name });
+  app.get("/v1/style-profiles/:profileName", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
+    const { profileName } = req.params as { profileName: string };
+
+    const latest = await getArtifactLatest({ projectId, type: "style_profile", name: profileName });
     if (!latest) return { error: "not_found" };
     return latest;
   });
 
-  app.put("/v1/projects/:projectId/character-sheets/:name", async (req) => {
-    const { projectId, name } = req.params as { projectId: string; name: string };
+  app.put("/v1/character-sheets/:sheetName", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
+    const { sheetName } = req.params as { sheetName: string };
 
     const parsed = CharacterSheetSchema.safeParse(req.body);
     const data = parsed.success ? parsed.data : badRequest("Invalid character sheet");
@@ -201,25 +189,29 @@ export async function registerRoutes(app: FastifyInstance) {
     return upsertArtifact({
       projectId,
       type: "character_sheet",
-      name,
+      name: sheetName,
       schemaVersion: data.schema_version,
       payload: data
     });
   });
 
-  app.get("/v1/projects/:projectId/character-sheets/:name", async (req) => {
-    const { projectId, name } = req.params as { projectId: string; name: string };
-    const latest = await getArtifactLatest({ projectId, type: "character_sheet", name });
+  app.get("/v1/character-sheets/:sheetName", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
+    const { sheetName } = req.params as { sheetName: string };
+
+    const latest = await getArtifactLatest({ projectId, type: "character_sheet", name: sheetName });
     if (!latest) return { error: "not_found" };
     return latest;
   });
 
-  app.post("/v1/projects/:projectId/draft-directives", async (req) => {
-    const { projectId } = req.params as { projectId: string };
-    const q = req.query as { name?: string };
+  app.post("/v1/draft-directives", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
+    const q = req.query as { directiveName?: string };
 
     const directiveName =
-      q.name && typeof q.name === "string" && q.name.trim().length > 0 ? q.name : "current";
+      q.directiveName && typeof q.directiveName === "string" && q.directiveName.trim().length > 0
+        ? q.directiveName
+        : "current";
 
     const parsed = DraftDirectiveSchema.safeParse(req.body);
     const data = parsed.success ? parsed.data : badRequest("Invalid draft directive");
@@ -233,12 +225,12 @@ export async function registerRoutes(app: FastifyInstance) {
     });
   });
 
-  app.post("/v1/projects/:projectId/revision-plans", async (req) => {
-    const { projectId } = req.params as { projectId: string };
-    const q = req.query as { name?: string };
+  app.post("/v1/revision-plans", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
+    const q = req.query as { planName?: string };
 
     const planName =
-      q.name && typeof q.name === "string" && q.name.trim().length > 0 ? q.name : "current";
+      q.planName && typeof q.planName === "string" && q.planName.trim().length > 0 ? q.planName : "current";
 
     const parsed = RevisionPlanRequestSchema.safeParse(req.body);
     const reqData = parsed.success ? parsed.data : badRequest("Invalid revision plan request");
@@ -320,23 +312,13 @@ export async function registerRoutes(app: FastifyInstance) {
     });
   });
 
-  app.post("/v1/projects/:projectId/diagnostics/prose", async (req) => {
-    const { projectId } = req.params as { projectId: string };
+  app.post("/v1/diagnostics/prose", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
 
     const parsed = ProseDiagnosticRequestSchema.safeParse(req.body);
     const data = parsed.success ? parsed.data : badRequest("Invalid diagnostic request");
 
-    const { text, directive_name, style_profile_name } = data;
-
-    const directive = directive_name
-      ? await getArtifactLatest({ projectId, type: "draft_directive", name: directive_name })
-      : null;
-
-    const style = style_profile_name
-      ? await getArtifactLatest({ projectId, type: "style_profile", name: style_profile_name })
-      : null;
-
-    const analysis = analyzeProse(text);
+    const analysis = analyzeProse(data.text);
 
     const issues: Array<{
       severity: "info" | "warn" | "error";
@@ -387,23 +369,6 @@ export async function registerRoutes(app: FastifyInstance) {
       });
     }
 
-    if (directive && directive.payload && typeof directive.payload === "object") {
-      issues.push({
-        severity: "info",
-        category: "style_alignment",
-        message:
-          "Directive referenced; ensure draft satisfies objective, conflict, stakes, and beat order"
-      });
-    }
-
-    if (style && style.payload && typeof style.payload === "object") {
-      issues.push({
-        severity: "info",
-        category: "style_alignment",
-        message: "Style profile referenced; apply technique rules without copying wording"
-      });
-    }
-
     const report = {
       schema_version: data.schema_version,
       metrics: analysis.metrics,
@@ -419,6 +384,34 @@ export async function registerRoutes(app: FastifyInstance) {
     });
   });
 
+  // -------------------------
+  // Optional multi-project routes (keep these)
+  // -------------------------
+
+  app.post("/v1/projects", async (req) => {
+    const parsed = ProjectCreateSchema.safeParse(req.body ?? {});
+    const data = parsed.success ? parsed.data : badRequest("Invalid project request");
+
+    const created = await prisma.project.create({
+      data: { name: data.name ?? null }
+    });
+
+    return { project_id: created.id };
+  });
+
+  app.get("/v1/projects", async () => {
+    const projects = await prisma.project.findMany({ orderBy: { updatedAt: "desc" } });
+    return {
+      projects: projects.map((p) => ({
+        project_id: p.id,
+        name: p.name,
+        created_at: p.createdAt,
+        updated_at: p.updatedAt
+      }))
+    };
+  });
+
+  // Deterministic error responses
   app.setErrorHandler((error, _req, reply) => {
     const status = (error as any).statusCode ?? 500;
     reply.code(status).send({
