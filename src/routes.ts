@@ -1,7 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import fs from "node:fs";
 import path from "node:path";
-import { z } from "zod";
 
 import { prisma } from "./prisma.js";
 import { analyzeProse } from "./prose_diagnostics.js";
@@ -13,7 +12,8 @@ import {
   DraftDirectiveSchema,
   StyleProfileSchema,
   CharacterSheetSchema,
-  ArtifactTypeSchema
+  ArtifactTypeSchema,
+  ArtifactUpsertSchema
 } from "./validation.js";
 import type { ArtifactType } from "./types.js";
 import {
@@ -24,7 +24,7 @@ import {
   getArtifactRevision
 } from "./artifacts.js";
 
-function badRequest(message: string) {
+function badRequest(message: string): never {
   const err = new Error(message);
   // @ts-expect-error fastify reads statusCode
   err.statusCode = 400;
@@ -32,7 +32,9 @@ function badRequest(message: string) {
 }
 
 function asArtifactType(s: string): ArtifactType {
-  return ArtifactTypeSchema.parse(s);
+  const parsed = ArtifactTypeSchema.safeParse(s);
+  if (!parsed.success) badRequest("Invalid artifact type");
+  return parsed.data;
 }
 
 export async function registerRoutes(app: FastifyInstance) {
@@ -47,10 +49,10 @@ export async function registerRoutes(app: FastifyInstance) {
   // Projects
   app.post("/v1/projects", async (req) => {
     const parsed = ProjectCreateSchema.safeParse(req.body ?? {});
-    if (!parsed.success) badRequest("Invalid project request");
+    const data = parsed.success ? parsed.data : badRequest("Invalid project request");
 
     const created = await prisma.project.create({
-      data: { name: parsed.data.name ?? null }
+      data: { name: data.name ?? null }
     });
 
     return { project_id: created.id };
@@ -74,16 +76,11 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const artifacts = await listArtifacts(projectId);
 
-    const style_profiles = artifacts.filter((a) => a.type === "style_profile").map((a) => a.name);
-    const characters = artifacts.filter((a) => a.type === "character_sheet").map((a) => a.name);
-
-    const draft_directives = artifacts.filter((a) => a.type === "draft_directive").map((a) => a.name);
-
     return {
       project_id: projectId,
-      style_profiles,
-      characters,
-      draft_directives
+      style_profiles: artifacts.filter((a) => a.type === "style_profile").map((a) => a.name),
+      characters: artifacts.filter((a) => a.type === "character_sheet").map((a) => a.name),
+      draft_directives: artifacts.filter((a) => a.type === "draft_directive").map((a) => a.name)
     };
   });
 
@@ -97,12 +94,16 @@ export async function registerRoutes(app: FastifyInstance) {
   });
 
   app.put("/v1/projects/:projectId/artifacts/:type/:name", async (req) => {
-    const { projectId, type, name } = req.params as { projectId: string; type: string; name: string };
-
-    const body = req.body as { schema_version?: number; payload?: unknown };
-    if (!body || typeof body.schema_version !== "number") badRequest("schema_version is required");
+    const { projectId, type, name } = req.params as {
+      projectId: string;
+      type: string;
+      name: string;
+    };
 
     const artifactType = asArtifactType(type);
+
+    const parsedBody = ArtifactUpsertSchema.safeParse(req.body);
+    const body = parsedBody.success ? parsedBody.data : badRequest("Invalid artifact upsert body");
 
     const result = await upsertArtifact({
       projectId,
@@ -116,7 +117,12 @@ export async function registerRoutes(app: FastifyInstance) {
   });
 
   app.get("/v1/projects/:projectId/artifacts/:type/:name", async (req) => {
-    const { projectId, type, name } = req.params as { projectId: string; type: string; name: string };
+    const { projectId, type, name } = req.params as {
+      projectId: string;
+      type: string;
+      name: string;
+    };
+
     const artifactType = asArtifactType(type);
 
     const latest = await getArtifactLatest({ projectId, type: artifactType, name });
@@ -125,7 +131,12 @@ export async function registerRoutes(app: FastifyInstance) {
   });
 
   app.get("/v1/projects/:projectId/artifacts/:type/:name/revisions", async (req) => {
-    const { projectId, type, name } = req.params as { projectId: string; type: string; name: string };
+    const { projectId, type, name } = req.params as {
+      projectId: string;
+      type: string;
+      name: string;
+    };
+
     const artifactType = asArtifactType(type);
 
     const list = await listArtifactRevisions({ projectId, type: artifactType, name });
@@ -140,12 +151,19 @@ export async function registerRoutes(app: FastifyInstance) {
       name: string;
       revision: string;
     };
+
     const artifactType = asArtifactType(type);
 
     const revNum = Number(revision);
     if (!Number.isInteger(revNum) || revNum < 1) badRequest("revision must be a positive integer");
 
-    const item = await getArtifactRevision({ projectId, type: artifactType, name, revision: revNum });
+    const item = await getArtifactRevision({
+      projectId,
+      type: artifactType,
+      name,
+      revision: revNum
+    });
+
     if (!item) return { error: "not_found" };
     return item;
   });
@@ -156,17 +174,15 @@ export async function registerRoutes(app: FastifyInstance) {
     const { projectId, name } = req.params as { projectId: string; name: string };
 
     const parsed = StyleProfileSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid style profile");
+    const data = parsed.success ? parsed.data : badRequest("Invalid style profile");
 
-    const result = await upsertArtifact({
+    return upsertArtifact({
       projectId,
       type: "style_profile",
       name,
-      schemaVersion: parsed.data.schema_version,
-      payload: parsed.data
+      schemaVersion: data.schema_version,
+      payload: data
     });
-
-    return result;
   });
 
   app.get("/v1/projects/:projectId/style-profiles/:name", async (req) => {
@@ -180,17 +196,15 @@ export async function registerRoutes(app: FastifyInstance) {
     const { projectId, name } = req.params as { projectId: string; name: string };
 
     const parsed = CharacterSheetSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid character sheet");
+    const data = parsed.success ? parsed.data : badRequest("Invalid character sheet");
 
-    const result = await upsertArtifact({
+    return upsertArtifact({
       projectId,
       type: "character_sheet",
       name,
-      schemaVersion: parsed.data.schema_version,
-      payload: parsed.data
+      schemaVersion: data.schema_version,
+      payload: data
     });
-
-    return result;
   });
 
   app.get("/v1/projects/:projectId/character-sheets/:name", async (req) => {
@@ -203,32 +217,33 @@ export async function registerRoutes(app: FastifyInstance) {
   app.post("/v1/projects/:projectId/draft-directives", async (req) => {
     const { projectId } = req.params as { projectId: string };
     const q = req.query as { name?: string };
-    const name = q.name && typeof q.name === "string" ? q.name : "current";
+
+    const directiveName =
+      q.name && typeof q.name === "string" && q.name.trim().length > 0 ? q.name : "current";
 
     const parsed = DraftDirectiveSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid draft directive");
+    const data = parsed.success ? parsed.data : badRequest("Invalid draft directive");
 
-    const result = await upsertArtifact({
+    return upsertArtifact({
       projectId,
       type: "draft_directive",
-      name,
-      schemaVersion: parsed.data.schema_version,
-      payload: parsed.data
+      name: directiveName,
+      schemaVersion: data.schema_version,
+      payload: data
     });
-
-    return result;
   });
 
   app.post("/v1/projects/:projectId/revision-plans", async (req) => {
     const { projectId } = req.params as { projectId: string };
     const q = req.query as { name?: string };
-    const name = q.name && typeof q.name === "string" ? q.name : "current";
+
+    const planName =
+      q.name && typeof q.name === "string" && q.name.trim().length > 0 ? q.name : "current";
 
     const parsed = RevisionPlanRequestSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid revision plan request");
+    const reqData = parsed.success ? parsed.data : badRequest("Invalid revision plan request");
 
-    // Deterministic rubric; the Custom GPT performs the rewrite.
-    const mode = parsed.data.mode;
+    const mode = reqData.mode;
 
     const rubricBase: string[] = [
       "Preserve meaning and intent unless explicitly told to change it",
@@ -276,8 +291,8 @@ export async function registerRoutes(app: FastifyInstance) {
       ]
     };
 
-    const plan = {
-      schema_version: parsed.data.schema_version,
+    const planCandidate = {
+      schema_version: reqData.schema_version,
       mode,
       rubric: [...rubricBase, ...(modeRubric[mode] ?? [])],
       risks_to_avoid: [
@@ -294,29 +309,25 @@ export async function registerRoutes(app: FastifyInstance) {
       ]
     };
 
-    // Validate the constructed object against schema
-    const validated = RevisionPlanSchema.parse(plan);
+    const plan = RevisionPlanSchema.parse(planCandidate);
 
-    const result = await upsertArtifact({
+    return upsertArtifact({
       projectId,
       type: "revision_plan",
-      name,
-      schemaVersion: validated.schema_version,
-      payload: validated
+      name: planName,
+      schemaVersion: plan.schema_version,
+      payload: plan
     });
-
-    return result;
   });
 
   app.post("/v1/projects/:projectId/diagnostics/prose", async (req) => {
     const { projectId } = req.params as { projectId: string };
 
     const parsed = ProseDiagnosticRequestSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid diagnostic request");
+    const data = parsed.success ? parsed.data : badRequest("Invalid diagnostic request");
 
-    const { text, directive_name, style_profile_name } = parsed.data;
+    const { text, directive_name, style_profile_name } = data;
 
-    // Load optional constraints if referenced
     const directive = directive_name
       ? await getArtifactLatest({ projectId, type: "draft_directive", name: directive_name })
       : null;
@@ -327,9 +338,20 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const analysis = analyzeProse(text);
 
-    const issues: Array<{ severity: "info" | "warn" | "error"; category: any; message: string }> = [];
+    const issues: Array<{
+      severity: "info" | "warn" | "error";
+      category:
+        | "coherence"
+        | "clarity"
+        | "continuity"
+        | "marketability"
+        | "style_alignment"
+        | "filler"
+        | "rhythm"
+        | "dialogue";
+      message: string;
+    }> = [];
 
-    // Deterministic issue generation based on metrics
     const m = analysis.metrics;
 
     if (m.word_count > 0 && m.avg_sentence_words > 30) {
@@ -356,7 +378,8 @@ export async function registerRoutes(app: FastifyInstance) {
       });
     }
 
-    if (m.adverb_like_count > Math.max(3, Math.floor(m.word_count / 250))) {
+    const adverbThreshold = Math.max(3, Math.floor(m.word_count / 250));
+    if (m.adverb_like_count > adverbThreshold) {
       issues.push({
         severity: "info",
         category: "clarity",
@@ -368,7 +391,8 @@ export async function registerRoutes(app: FastifyInstance) {
       issues.push({
         severity: "info",
         category: "style_alignment",
-        message: "Directive referenced; ensure draft satisfies objective, conflict, stakes, and beat order"
+        message:
+          "Directive referenced; ensure draft satisfies objective, conflict, stakes, and beat order"
       });
     }
 
@@ -376,29 +400,25 @@ export async function registerRoutes(app: FastifyInstance) {
       issues.push({
         severity: "info",
         category: "style_alignment",
-        message: "Style profile referenced; ensure technique rules are applied without copying wording"
+        message: "Style profile referenced; apply technique rules without copying wording"
       });
     }
 
     const report = {
-      schema_version: parsed.data.schema_version,
+      schema_version: data.schema_version,
       metrics: analysis.metrics,
       issues
     };
 
-    // Store report as artifact for auditability
-    const result = await upsertArtifact({
+    return upsertArtifact({
       projectId,
       type: "quality_report",
       name: "latest",
       schemaVersion: report.schema_version,
       payload: report
     });
-
-    return result;
   });
 
-  // Error handling: keep responses small and deterministic
   app.setErrorHandler((error, _req, reply) => {
     const status = (error as any).statusCode ?? 500;
     reply.code(status).send({
