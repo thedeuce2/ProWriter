@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import fs from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 
 import { prisma } from "./prisma.js";
 import { analyzeProse } from "./prose_diagnostics.js";
@@ -31,7 +32,7 @@ const DEFAULT_STYLE_PROFILE_NAME = "prowriter_default";
  * Default operating style for ProWriter.
  * Seeded once into the DB so the GPT can reference it consistently.
  *
- * Goal: grounded, clear, concise, active, no "writerly fog", no cliché.
+ * Goal: grounded, clear, concise, active, no cliché, no abstract metaphor fog.
  */
 const DEFAULT_STYLE_PROFILE = {
   schema_version: 1,
@@ -43,43 +44,27 @@ const DEFAULT_STYLE_PROFILE = {
     punctuation_habits:
       "Clean punctuation. Avoid em-dash chains, rhetorical fragments, and breathless cadence unless the POV voice demands it.",
     paragraphing:
-      "Paragraphs are action units. Break on a turn: decision, reveal, escalation, or consequence. No static paragraphs."
+      "Paragraphs are action units. Break on a turn: decision, reveal, escalation, consequence. No static paragraphs."
   },
   diction: {
-    register:
-      "Plainspoken, precise, concrete. Use simple language whenever possible. Avoid inflated literary phrasing.",
+    register: "Simple language first. Concrete, precise. Avoid inflated literary phrasing.",
     concreteness_bias:
       "Write what can be seen, heard, touched, done, decided. Replace abstract labels with observable behavior and specific objects.",
-    verb_energy:
-      "Active voice by default. Strong verbs over adverbs. Make motion, intent, and cause-and-effect obvious.",
+    verb_energy: "Active voice by default. Strong verbs over adverbs. Make cause-and-effect obvious.",
     adjective_policy:
       "Minimal modifiers. Use one precise adjective only when it changes meaning. If it’s decorative, cut it."
-  },
-  imagery_and_metaphor: {
-    purpose:
-      "Metaphor is allowed only if it clarifies emotion, power dynamics, or sensory reality. Never decorative.",
-    when_used:
-      "Use metaphor only at turning points (realization, escalation, reversal) and keep it brief and grounded.",
-    how_used:
-      "Concrete, physical, anchored to the POV character’s lived world. No cosmic abstraction. If it can’t be stated literally, it doesn’t belong.",
-    metaphor_budget:
-      "Default 0 metaphors per paragraph. If used, max 1, and it must earn its place by increasing clarity or tension.",
-    disallowed: [
-      "cliché metaphors",
-      "cosmic/generalized abstraction (universe, abyss, eternity, void, darkness-as-mood)",
-      "dreamlike/fog/shattered/whispered-into-the-night phrasing",
-      "metaphor that does not translate cleanly into literal meaning"
-    ]
   },
   constraints: {
     must_avoid: [
       "clichés",
       "throat-clearing and filler",
       "generic emotion labels without behavior",
-      "passive voice unless the agent is unknown/hidden on purpose",
+      "passive voice unless agent is unknown/hidden on purpose",
       "abstract commentary that does not affect action or choice",
       "symmetrical AI cadence and over-balanced sentences",
-      "decorative metaphor"
+      "decorative metaphor",
+      "cosmic/generalized abstraction (universe, abyss, eternity, void, darkness-as-mood)",
+      "dreamlike/fog/shattered/whispered-into-the-night phrasing"
     ],
     must_include: [
       "show-dont-tell via behavior + concrete detail + consequence",
@@ -92,6 +77,247 @@ const DEFAULT_STYLE_PROFILE = {
       "Follow user boundaries. Default: grounded adult themes allowed; avoid explicit sexual content unless the user explicitly requests it."
   }
 } as const;
+
+/* -----------------------------
+   Deterministic "De-AI" Edit Helpers
+   (No LLM calls. Heuristic detection + safe deletions only.)
+------------------------------ */
+
+type DeAiSeverity = "info" | "warn" | "error";
+type DeAiFlagKind = "personification" | "vague_language" | "abstract_simile" | "cliche" | "rhetorical_frame" | "filler";
+
+type TextSpan = {
+  start: number;
+  end: number;
+  snippet: string;
+};
+
+type DeAiFlag = {
+  kind: DeAiFlagKind;
+  severity: DeAiSeverity;
+  message: string;
+  spans: TextSpan[];
+};
+
+type DeAiEditOp = {
+  op: "delete" | "replace";
+  span: TextSpan;
+  replacement: string | null;
+  note: string;
+};
+
+const PERSONIFICATION_VERBS = ["begged", "whispered", "groaned", "sighed", "gasped", "moaned", "pleaded", "sang"];
+
+const VAGUE_WORDS = [
+  "somehow",
+  "suddenly",
+  "really",
+  "very",
+  "just",
+  "kind of",
+  "sort of",
+  "thing",
+  "stuff",
+  "wrong",
+  "strange",
+  "dark",
+  "beautiful"
+];
+
+const BANNED_PHRASES = [
+  "like a dream",
+  "like a nightmare",
+  "time stood still",
+  "in the blink of an eye",
+  "cold as ice",
+  "silence was deafening"
+];
+
+const ABSTRACT_SIMILE_TARGETS = ["sin", "evil", "darkness", "the abyss", "death", "fate", "destiny"];
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function clampSnippet(text: string, start: number, end: number): string {
+  const s = Math.max(0, start);
+  const e = Math.min(text.length, end);
+  return text.slice(s, e);
+}
+
+function spansForRegex(text: string, re: RegExp, maxMatches = 60): TextSpan[] {
+  const spans: TextSpan[] = [];
+  const global = re.global ? re : new RegExp(re.source, re.flags + "g");
+  let count = 0;
+
+  for (const m of text.matchAll(global)) {
+    const idx = m.index;
+    if (idx === undefined) continue;
+    const start = idx;
+    const end = start + m[0].length;
+    spans.push({ start, end, snippet: clampSnippet(text, start, end) });
+    count += 1;
+    if (count >= maxMatches) break;
+  }
+
+  return spans;
+}
+
+function phraseSpans(text: string, phrase: string, maxMatches = 40): TextSpan[] {
+  const spans: TextSpan[] = [];
+  const needle = phrase.toLowerCase();
+  const hay = text.toLowerCase();
+  let idx = 0;
+  let count = 0;
+
+  while (true) {
+    const found = hay.indexOf(needle, idx);
+    if (found === -1) break;
+    const start = found;
+    const end = found + phrase.length;
+    spans.push({ start, end, snippet: clampSnippet(text, start, end) });
+    idx = end;
+    count += 1;
+    if (count >= maxMatches) break;
+  }
+
+  return spans;
+}
+
+function generateDeAiReport(text: string): {
+  schema_version: 1;
+  counts: Record<string, number>;
+  flags: DeAiFlag[];
+  suggested_ops: DeAiEditOp[];
+} {
+  const flags: DeAiFlag[] = [];
+  const suggested_ops: DeAiEditOp[] = [];
+
+  // Personification: "the mud begged", "a creek groaned", etc.
+  const personificationRe = new RegExp(
+    String.raw`\b(?:the|a|an)\s+[a-z][\w-]*\s+(?:${PERSONIFICATION_VERBS.map(escapeRe).join("|")})\b`,
+    "gi"
+  );
+  const personSpans = spansForRegex(text, personificationRe);
+  if (personSpans.length > 0) {
+    flags.push({
+      kind: "personification",
+      severity: "warn",
+      message:
+        "Personification detected. Replace with literal physical behavior (what actually happens) rather than giving objects human intent.",
+      spans: personSpans
+    });
+  }
+
+  // Vague words
+  const vagueSpans: TextSpan[] = [];
+  for (const w of VAGUE_WORDS) {
+    const re = new RegExp(String.raw`\b${escapeRe(w)}\b`, "gi");
+    vagueSpans.push(...spansForRegex(text, re));
+  }
+  if (vagueSpans.length > 0) {
+    flags.push({
+      kind: "vague_language",
+      severity: "warn",
+      message: "Vague language detected. Replace with specific nouns/verbs or remove if it adds no meaning.",
+      spans: vagueSpans.slice(0, 80)
+    });
+  }
+
+  // Abstract similes: "like sin", "like fate", etc.
+  const abstractSimileRe = new RegExp(
+    String.raw`\blike\s+(?:${ABSTRACT_SIMILE_TARGETS.map(escapeRe).join("|")})\b`,
+    "gi"
+  );
+  const absSpans = spansForRegex(text, abstractSimileRe);
+  if (absSpans.length > 0) {
+    flags.push({
+      kind: "abstract_simile",
+      severity: "warn",
+      message:
+        "Abstract simile detected. Replace with a concrete comparison anchored to the POV character’s world (physical, practical, specific).",
+      spans: absSpans
+    });
+  }
+
+  // Hard-banned cliché phrases
+  const clicheSpans: TextSpan[] = [];
+  for (const p of BANNED_PHRASES) clicheSpans.push(...phraseSpans(text, p));
+  if (clicheSpans.length > 0) {
+    flags.push({
+      kind: "cliche",
+      severity: "error",
+      message: "Cliché phrase detected. Remove or replace with specific, original detail.",
+      spans: clicheSpans
+    });
+    for (const sp of clicheSpans.slice(0, 20)) {
+      suggested_ops.push({ op: "delete", span: sp, replacement: null, note: "Remove cliché phrase" });
+    }
+  }
+
+  // Rhetorical filter phrases: "you could taste it:", etc.
+  const rhetoricalRe = /\byou could (?:taste|feel|hear|see)\s+it\b\s*:?/gi;
+  const rhetSpans = spansForRegex(text, rhetoricalRe);
+  if (rhetSpans.length > 0) {
+    flags.push({
+      kind: "rhetorical_frame",
+      severity: "info",
+      message: 'Rhetorical filter phrase detected ("you could ..."). Prefer direct sensory statements without the filter.',
+      spans: rhetSpans
+    });
+  }
+
+  // Filler words (safe deletions)
+  const fillerTargets = ["very", "really", "just", "somehow"];
+  const fillerSpans: TextSpan[] = [];
+  for (const w of fillerTargets) {
+    const re = new RegExp(String.raw`\b${escapeRe(w)}\b`, "gi");
+    fillerSpans.push(...spansForRegex(text, re));
+  }
+  if (fillerSpans.length > 0) {
+    flags.push({
+      kind: "filler",
+      severity: "info",
+      message: "Filler detected. Remove unless it changes literal meaning.",
+      spans: fillerSpans.slice(0, 80)
+    });
+    for (const sp of fillerSpans.slice(0, 40)) {
+      suggested_ops.push({ op: "delete", span: sp, replacement: null, note: "Remove filler word" });
+    }
+  }
+
+  return {
+    schema_version: 1,
+    counts: {
+      personification: personSpans.length,
+      vague_language: vagueSpans.length,
+      abstract_simile: absSpans.length,
+      cliche: clicheSpans.length,
+      rhetorical_frame: rhetSpans.length,
+      filler: fillerSpans.length
+    },
+    flags,
+    suggested_ops
+  };
+}
+
+function applySafeDeAiOps(text: string, ops: DeAiEditOp[]): { text: string; applied: DeAiEditOp[] } {
+  // Only apply deletes (no replacements) to avoid changing meaning unpredictably.
+  const deletes = ops.filter((o) => o.op === "delete").slice(0, 80);
+
+  // Apply from end to start so indices stay valid.
+  const sorted = deletes.slice().sort((a, b) => b.span.start - a.span.start);
+
+  let out = text;
+  for (const op of sorted) {
+    out = out.slice(0, op.span.start) + out.slice(op.span.end);
+  }
+  return { text: out, applied: deletes };
+}
+
+/* -----------------------------
+   Core route helpers
+------------------------------ */
 
 function badRequest(message: string): never {
   const err = new Error(message);
@@ -114,11 +340,7 @@ function nonEmptyQueryString(value: unknown, fallback: string): string {
 
 async function ensureDefaultStyleProfile(projectId: string): Promise<void> {
   const existing = await prisma.artifact.findFirst({
-    where: {
-      projectId,
-      type: "style_profile",
-      name: DEFAULT_STYLE_PROFILE_NAME
-    },
+    where: { projectId, type: "style_profile", name: DEFAULT_STYLE_PROFILE_NAME },
     select: { id: true }
   });
 
@@ -133,7 +355,7 @@ async function ensureDefaultStyleProfile(projectId: string): Promise<void> {
       payload: DEFAULT_STYLE_PROFILE
     });
   } catch {
-    // Race on first boot (two requests at once). Safe to ignore.
+    // If two requests race on first boot, one will win. Safe to ignore.
   }
 }
 
@@ -147,9 +369,12 @@ async function getOrCreateDefaultProjectId(): Promise<string> {
     : (await prisma.project.create({ data: { name: DEFAULT_PROJECT_NAME } })).id;
 
   await ensureDefaultStyleProfile(projectId);
-
   return projectId;
 }
+
+/* -----------------------------
+   Routes
+------------------------------ */
 
 export async function registerRoutes(app: FastifyInstance) {
   // Deterministic error responses
@@ -197,6 +422,7 @@ export async function registerRoutes(app: FastifyInstance) {
   app.get("/v1/artifacts", async (req) => {
     const projectId = await getOrCreateDefaultProjectId();
     const q = req.query as { type?: string };
+
     const type = q.type ? asArtifactType(q.type) : undefined;
     return { artifacts: await listArtifacts(projectId, type) };
   });
@@ -208,7 +434,8 @@ export async function registerRoutes(app: FastifyInstance) {
     const artifactType = asArtifactType(type);
 
     const parsedBody = ArtifactUpsertSchema.safeParse(req.body);
-    const body = parsedBody.success ? parsedBody.data : badRequest("Invalid artifact upsert body");
+    if (!parsedBody.success) badRequest("Invalid artifact upsert body");
+    const body = parsedBody.data;
 
     return upsertArtifact({
       projectId,
@@ -243,11 +470,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.get("/v1/artifacts/:type/:name/revisions/:revision", async (req) => {
     const projectId = await getOrCreateDefaultProjectId();
-    const { type, name, revision } = req.params as {
-      type: string;
-      name: string;
-      revision: string;
-    };
+    const { type, name, revision } = req.params as { type: string; name: string; revision: string };
 
     const artifactType = asArtifactType(type);
 
@@ -270,7 +493,8 @@ export async function registerRoutes(app: FastifyInstance) {
     const { profileName } = req.params as { profileName: string };
 
     const parsed = StyleProfileSchema.safeParse(req.body);
-    const data = parsed.success ? parsed.data : badRequest("Invalid style profile");
+    if (!parsed.success) badRequest("Invalid style profile");
+    const data = parsed.data;
 
     return upsertArtifact({
       projectId,
@@ -295,7 +519,8 @@ export async function registerRoutes(app: FastifyInstance) {
     const { sheetName } = req.params as { sheetName: string };
 
     const parsed = CharacterSheetSchema.safeParse(req.body);
-    const data = parsed.success ? parsed.data : badRequest("Invalid character sheet");
+    if (!parsed.success) badRequest("Invalid character sheet");
+    const data = parsed.data;
 
     return upsertArtifact({
       projectId,
@@ -322,7 +547,8 @@ export async function registerRoutes(app: FastifyInstance) {
     const directiveName = nonEmptyQueryString(q.directiveName, "current");
 
     const parsed = DraftDirectiveSchema.safeParse(req.body);
-    const data = parsed.success ? parsed.data : badRequest("Invalid draft directive");
+    if (!parsed.success) badRequest("Invalid draft directive");
+    const data = parsed.data;
 
     return upsertArtifact({
       projectId,
@@ -340,7 +566,8 @@ export async function registerRoutes(app: FastifyInstance) {
     const planName = nonEmptyQueryString(q.planName, "current");
 
     const parsed = RevisionPlanRequestSchema.safeParse(req.body);
-    const reqData = parsed.success ? parsed.data : badRequest("Invalid revision plan request");
+    if (!parsed.success) badRequest("Invalid revision plan request");
+    const reqData = parsed.data;
 
     const mode = reqData.mode;
 
@@ -424,7 +651,8 @@ export async function registerRoutes(app: FastifyInstance) {
     const projectId = await getOrCreateDefaultProjectId();
 
     const parsed = ProseDiagnosticRequestSchema.safeParse(req.body);
-    const data = parsed.success ? parsed.data : badRequest("Invalid diagnostic request");
+    if (!parsed.success) badRequest("Invalid diagnostic request");
+    const data = parsed.data;
 
     const analysis = analyzeProse(data.text);
 
@@ -496,13 +724,59 @@ export async function registerRoutes(app: FastifyInstance) {
     });
   });
 
+  // NEW: Deterministic de-AI edit report (and optional safe auto-clean)
+  const DeAiEditsRequestSchema = z.object({
+    schema_version: z.number().int().min(1),
+    text: z.string().min(1).max(200000),
+    apply: z.boolean().optional()
+  });
+
+  app.post("/v1/edits/deai", async (req) => {
+    const projectId = await getOrCreateDefaultProjectId();
+
+    const parsed = DeAiEditsRequestSchema.safeParse(req.body);
+    if (!parsed.success) badRequest("Invalid de-AI edit request");
+    const data = parsed.data;
+
+    const report = generateDeAiReport(data.text);
+
+    let cleaned_text: string | null = null;
+    let applied_ops: DeAiEditOp[] = [];
+
+    if (data.apply === true) {
+      const applied = applySafeDeAiOps(data.text, report.suggested_ops);
+      cleaned_text = applied.text;
+      applied_ops = applied.applied;
+    }
+
+    const response = {
+      schema_version: 1 as const,
+      counts: report.counts,
+      flags: report.flags,
+      applied_ops,
+      cleaned_text
+    };
+
+    // Persist for traceability (separate from prose diagnostics)
+    await upsertArtifact({
+      projectId,
+      type: "quality_report",
+      name: "deai_latest",
+      schemaVersion: 1,
+      payload: response
+    });
+
+    return response;
+  });
+
   // -------------------------
   // Optional multi-project routes (keep these)
   // -------------------------
 
   app.post("/v1/projects", async (req) => {
     const parsed = ProjectCreateSchema.safeParse(req.body ?? {});
-    const data = parsed.success ? parsed.data : badRequest("Invalid project request");
+    if (!parsed.success) badRequest("Invalid project request");
+    const data = parsed.data;
 
     const created = await prisma.project.create({
       data: { name: data.name ?? null }
