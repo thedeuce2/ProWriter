@@ -25,6 +25,73 @@ import {
 } from "./artifacts.js";
 
 const DEFAULT_PROJECT_NAME = "default";
+const DEFAULT_STYLE_PROFILE_NAME = "prowriter_default";
+
+/**
+ * This is not "example" text — it's the default operating style for ProWriter.
+ * It gets seeded once into the DB so the GPT can always reference it.
+ */
+const DEFAULT_STYLE_PROFILE = {
+  schema_version: 1,
+  label: "ProWriter Default (clarity + purpose-first)",
+  influences: [],
+  rhythm: {
+    sentence_length_bias:
+      "Bias toward short/medium sentences; use a longer sentence only when it increases tension or reveals a thought-turn.",
+    punctuation_habits:
+      "Prefer clean punctuation. Avoid em-dash chains and rhetorical fragments unless voice demands it.",
+    paragraphing: "Paragraphs are action units. Break on a turn: decision, reveal, power shift, sensory interrupt."
+  },
+  diction: {
+    register: "Natural, contemporary, concrete. No pseudo-literary inflation.",
+    concreteness_bias: "Prefer observable behavior and specific objects over abstract labels.",
+    verb_energy: "Strong verbs over adverbs. Make motion legible.",
+    adjective_policy: "One precise modifier beats three decorative ones."
+  },
+  imagery_and_metaphor: {
+    purpose: "Metaphor is allowed only to clarify emotion, power dynamics, or sensory reality—not to decorate.",
+    when_used: "Use metaphor at turning points: realization, escalation, reversal, controlled breath after impact.",
+    how_used: "Brief, concrete, anchored to POV character’s world. No cosmic abstraction.",
+    metaphor_budget: "Max 1 metaphor per paragraph, and it must earn its place.",
+    disallowed: ["cosmic abstraction", "vague existential fog", "meaningless 'like a dream' phrasing", "random body-poetry"]
+  },
+  description_strategy: {
+    focus: "Describe what matters to the scene objective: threat, desire, leverage, evidence, escape routes.",
+    omissions: "Skip neutral detail unless it raises tension or reveals character.",
+    pacing: "If tension rises, compress description into sharp specifics. If tension drops, the writing must still change something."
+  },
+  theme_handling: {
+    approach: "Let themes emerge through choices, consequences, and repeated pressures—not speeches.",
+    recurrence_signals: "Use recurring objects, behaviors, and dilemmas rather than repeated statements."
+  },
+  pov_behavior: {
+    distance: "Close enough to feel thought; far enough to keep action clean.",
+    interiority: "Interiority must create a choice, a lie, or a contradiction—not commentary.",
+    reliability: "If unreliable, show bias via selective detail rather than confusion."
+  },
+  dialogue_behavior: {
+    subtext_rules: "Dialogue must have leverage. People avoid saying the real thing unless cornered.",
+    escalation_patterns: "Each exchange changes power: concession, threat, reveal, trap.",
+    exposition_hiding: "Hide exposition inside conflict: accusation, bargaining, misdirection, insult, confession."
+  },
+  constraints: {
+    must_avoid: ["filler reactions", "generic emotion labels without behavior", "metaphors that don't clarify", "AI-sounding symmetry"],
+    must_include: ["specific actions", "cause-and-effect clarity", "a turn per paragraph or per beat"],
+    rating_boundaries: "Follow user boundaries. Default: adult themes allowed, no explicit sexual content unless user requests."
+  },
+  application_rules: [
+    {
+      why: "Readers trust scenes that track physical reality and intent.",
+      when: "At the start of each paragraph and each dialogue exchange.",
+      how: "State who does what, what changes, and what it means for the objective."
+    },
+    {
+      why: "Marketable prose is clear, tense, and selective.",
+      when: "Anytime a passage feels writerly or indulgent.",
+      how: "Cut the pretty sentence unless it increases tension, reveals character, or sharpens meaning."
+    }
+  ]
+} as const;
 
 function badRequest(message: string): never {
   const err = new Error(message);
@@ -39,19 +106,60 @@ function asArtifactType(s: string): ArtifactType {
   return parsed.data;
 }
 
+function nonEmptyQueryString(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+
+async function ensureDefaultStyleProfile(projectId: string): Promise<void> {
+  const existing = await prisma.artifact.findFirst({
+    where: {
+      projectId,
+      type: "style_profile",
+      name: DEFAULT_STYLE_PROFILE_NAME
+    },
+    select: { id: true }
+  });
+
+  if (existing) return;
+
+  try {
+    await upsertArtifact({
+      projectId,
+      type: "style_profile",
+      name: DEFAULT_STYLE_PROFILE_NAME,
+      schemaVersion: 1,
+      payload: DEFAULT_STYLE_PROFILE
+    });
+  } catch {
+    // In case of a race on first boot (two requests at once), ignore.
+  }
+}
+
 async function getOrCreateDefaultProjectId(): Promise<string> {
   const existing = await prisma.project.findFirst({
     where: { name: DEFAULT_PROJECT_NAME }
   });
-  if (existing) return existing.id;
 
-  const created = await prisma.project.create({
-    data: { name: DEFAULT_PROJECT_NAME }
-  });
-  return created.id;
+  const projectId = existing
+    ? existing.id
+    : (await prisma.project.create({ data: { name: DEFAULT_PROJECT_NAME } })).id;
+
+  await ensureDefaultStyleProfile(projectId);
+
+  return projectId;
 }
 
 export async function registerRoutes(app: FastifyInstance) {
+  // Deterministic error responses
+  app.setErrorHandler((error, _req, reply) => {
+    const status = (error as any).statusCode ?? 500;
+    reply.code(status).send({
+      error: status === 500 ? "internal_error" : "bad_request"
+    });
+  });
+
   app.get("/health", async () => ({ ok: true }));
 
   app.get("/", async () => ({
@@ -62,6 +170,10 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.get("/openapi.yaml", async (_req, reply) => {
     const p = path.join(process.cwd(), "openapi.yaml");
+    if (!fs.existsSync(p)) {
+      reply.code(404).type("application/json").send({ error: "not_found" });
+      return;
+    }
     const yml = fs.readFileSync(p, "utf8");
     reply.type("text/yaml").send(yml);
   });
@@ -85,7 +197,6 @@ export async function registerRoutes(app: FastifyInstance) {
   app.get("/v1/artifacts", async (req) => {
     const projectId = await getOrCreateDefaultProjectId();
     const q = req.query as { type?: string };
-
     const type = q.type ? asArtifactType(q.type) : undefined;
     return { artifacts: await listArtifacts(projectId, type) };
   });
@@ -208,10 +319,7 @@ export async function registerRoutes(app: FastifyInstance) {
     const projectId = await getOrCreateDefaultProjectId();
     const q = req.query as { directiveName?: string };
 
-    const directiveName =
-      q.directiveName && typeof q.directiveName === "string" && q.directiveName.trim().length > 0
-        ? q.directiveName
-        : "current";
+    const directiveName = nonEmptyQueryString(q.directiveName, "current");
 
     const parsed = DraftDirectiveSchema.safeParse(req.body);
     const data = parsed.success ? parsed.data : badRequest("Invalid draft directive");
@@ -229,8 +337,7 @@ export async function registerRoutes(app: FastifyInstance) {
     const projectId = await getOrCreateDefaultProjectId();
     const q = req.query as { planName?: string };
 
-    const planName =
-      q.planName && typeof q.planName === "string" && q.planName.trim().length > 0 ? q.planName : "current";
+    const planName = nonEmptyQueryString(q.planName, "current");
 
     const parsed = RevisionPlanRequestSchema.safeParse(req.body);
     const reqData = parsed.success ? parsed.data : badRequest("Invalid revision plan request");
@@ -293,12 +400,7 @@ export async function registerRoutes(app: FastifyInstance) {
         "Metaphor that does not clarify action, feeling, or power dynamics",
         "Continuity contradictions"
       ],
-      recommended_passes: [
-        "Continuity pass",
-        "Clarity pass",
-        "Pacing pass",
-        "Line-level tightening pass"
-      ]
+      recommended_passes: ["Continuity pass", "Clarity pass", "Pacing pass", "Line-level tightening pass"]
     };
 
     const plan = RevisionPlanSchema.parse(planCandidate);
@@ -372,7 +474,11 @@ export async function registerRoutes(app: FastifyInstance) {
     const report = {
       schema_version: data.schema_version,
       metrics: analysis.metrics,
-      issues
+      issues,
+      meta: {
+        directive_name: (data as any).directive_name ?? null,
+        style_profile_name: (data as any).style_profile_name ?? DEFAULT_STYLE_PROFILE_NAME
+      }
     };
 
     return upsertArtifact({
@@ -409,13 +515,5 @@ export async function registerRoutes(app: FastifyInstance) {
         updated_at: p.updatedAt
       }))
     };
-  });
-
-  // Deterministic error responses
-  app.setErrorHandler((error, _req, reply) => {
-    const status = (error as any).statusCode ?? 500;
-    reply.code(status).send({
-      error: status === 500 ? "internal_error" : "bad_request"
-    });
   });
 }
