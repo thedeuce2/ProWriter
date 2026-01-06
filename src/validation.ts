@@ -1,119 +1,110 @@
-import { z } from "zod";
+import type { FastifyInstance } from "fastify";
+import fs from "node:fs";
+import path from "node:path";
 
-const ARTIFACT_TYPES = [
-  "style_profile",
-  "character_sheet",
-  "draft_directive",
-  "revision_plan",
-  "quality_report",
-  "freeform_note"
-] as const;
+import { prisma } from "./prisma.js";
+import { analyzeProse } from "./prose_diagnostics.js";
+import {
+  ProjectCreateSchema,
+  ProseDiagnosticRequestSchema,
+  RevisionPlanRequestSchema,
+  RevisionPlanSchema,
+  DraftDirectiveSchema,
+  StyleProfileSchema,
+  CharacterSheetSchema,
+  ArtifactTypeSchema,
+  ArtifactUpsertSchema
+} from "./validation.js";
+import type { ArtifactType } from "./types.js";
+import {
+  upsertArtifact,
+  getArtifactLatest,
+  listArtifacts,
+  listArtifactRevisions,
+  getArtifactRevision
+} from "./artifacts.js";
 
-const DELIVERABLES = [
-  "scene",
-  "chapter",
-  "cold_open",
-  "synopsis",
-  "pitch",
-  "query_letter",
-  "outline"
-] as const;
+function badRequest(message: string): never {
+  const err = new Error(message);
+  // @ts-expect-error fastify reads statusCode
+  err.statusCode = 400;
+  throw err;
+}
 
-const TENSES = ["past", "present"] as const;
-const SEVERITIES = ["info", "warn", "error"] as const;
+function asArtifactType(s: string): ArtifactType {
+  const parsed = ArtifactTypeSchema.safeParse(s);
+  if (!parsed.success) badRequest("Invalid artifact type");
+  return parsed.data;
+}
 
-const ISSUE_CATEGORIES = [
-  "coherence",
-  "clarity",
-  "continuity",
-  "marketability",
-  "style_alignment",
-  "filler",
-  "rhythm",
-  "dialogue"
-] as const;
+export async function registerRoutes(app: FastifyInstance) {
+  app.get("/health", async () => ({ ok: true }));
 
-export const ArtifactTypeSchema = z.enum(ARTIFACT_TYPES);
-export const DeliverableSchema = z.enum(DELIVERABLES);
-export const TenseSchema = z.enum(TENSES);
-export const SeveritySchema = z.enum(SEVERITIES);
-export const IssueCategorySchema = z.enum(ISSUE_CATEGORIES);
+  app.get("/openapi.yaml", async (_req, reply) => {
+    const p = path.join(process.cwd(), "openapi.yaml");
+    const yml = fs.readFileSync(p, "utf8");
+    reply.type("text/yaml").send(yml);
+  });
 
-export const ProjectCreateSchema = z.object({
-  name: z.string().min(1).max(200).optional()
-});
+  // Projects
+  app.post("/v1/projects", async (req) => {
+    const parsed = ProjectCreateSchema.safeParse(req.body ?? {});
+    if (!parsed.success) badRequest("Invalid project request");
 
-export const CharacterRelationshipSchema = z.object({
-  other_name: z.string().min(1).max(200),
-  relationship: z.string().min(1).max(500)
-});
+    const created = await prisma.project.create({
+      data: { name: parsed.data.name ?? null }
+    });
 
-export const CharacterSheetSchema = z.object({
-  schema_version: z.number().int().min(1),
-  name: z.string().min(1).max(200),
-  role_in_story: z.string().min(1).max(500).optional(),
-  pronouns: z.string().min(1).max(50).optional(),
-  age: z.number().int().min(0).max(130).optional(),
-  physical: z.string().min(1).max(2000).optional(),
-  voice: z.string().min(1).max(2000).optional(),
-  background: z.string().min(1).max(4000).optional(),
-  wants: z.array(z.string().min(1).max(500)).optional(),
-  fears: z.array(z.string().min(1).max(500)).optional(),
-  contradictions: z.array(z.string().min(1).max(500)).optional(),
-  relationships: z.array(CharacterRelationshipSchema).optional(),
-  notes: z.string().min(1).max(6000).optional()
-});
+    return { project_id: created.id };
+  });
 
-export const StyleProfileSchema = z.object({
-  schema_version: z.number().int().min(1),
-  label: z.string().min(1).max(200),
-  influences: z.array(z.string().min(1).max(200)).optional(),
-  rhythm: z
-    .object({
-      sentence_length_bias: z.string().min(1).max(500).optional(),
-      punctuation_habits: z.string().min(1).max(1000).optional(),
-      paragraphing: z.string().min(1).max(1000).optional()
-    })
-    .optional(),
-  diction: z
-    .object({
-      register: z.string().min(1).max(500).optional(),
-      concreteness_bias: z.string().min(1).max(500).optional(),
-      verb_energy: z.string().min(1).max(500).optional(),
-      adjective_policy: z.string().min(1).max(500).optional()
-    })
-    .optional(),
-  imagery_and_metaphor: z
-    .object({
-      purpose: z.string().min(1).max(1500).optional(),
-      when_used: z.string().min(1).max(1500).optional(),
-      how_used: z.string().min(1).max(1500).optional(),
-      metaphor_budget: z.string().min(1).max(500).optional(),
-      disallowed: z.array(z.string().min(1).max(200)).optional()
-    })
-    .optional(),
-  description_strategy: z
-    .object({
-      focus: z.string().min(1).max(1500).optional(),
-      omissions: z.string().min(1).max(1500).optional(),
-      pacing: z.string().min(1).max(1500).optional()
-    })
-    .optional(),
-  theme_handling: z
-    .object({
-      approach: z.string().min(1).max(1500).optional(),
-      recurrence_signals: z.string().min(1).max(1500).optional()
-    })
-    .optional(),
-  pov_behavior: z
-    .object({
-      distance: z.string().min(1).max(1000).optional(),
-      interiority: z.string().min(1).max(1000).optional(),
-      reliability: z.string().min(1).max(1000).optional()
-    })
-    .optional(),
-  dialogue_behavior: z
-    .object({
-      subtext_rules: z.string().min(1).max(1500).optional(),
-      escalation_patterns: z.string().min(1).max(1500).optional(),
-      exposition_hiding: z.string().min(1)._
+  app.get("/v1/projects", async () => {
+    const projects = await prisma.project.findMany({ orderBy: { updatedAt: "desc" } });
+    return {
+      projects: projects.map((p) => ({
+        project_id: p.id,
+        name: p.name,
+        created_at: p.createdAt,
+        updated_at: p.updatedAt
+      }))
+    };
+  });
+
+  // Canon digest (lightweight, deterministic)
+  app.get("/v1/projects/:projectId/canon-digest", async (req) => {
+    const { projectId } = req.params as { projectId: string };
+
+    const artifacts = await listArtifacts(projectId);
+
+    const style_profiles = artifacts
+      .filter((a) => a.type === "style_profile")
+      .map((a) => a.name);
+
+    const characters = artifacts
+      .filter((a) => a.type === "character_sheet")
+      .map((a) => a.name);
+
+    const draft_directives = artifacts
+      .filter((a) => a.type === "draft_directive")
+      .map((a) => a.name);
+
+    return {
+      project_id: projectId,
+      style_profiles,
+      characters,
+      draft_directives
+    };
+  });
+
+  // Generic artifact endpoints
+  app.get("/v1/projects/:projectId/artifacts", async (req) => {
+    const { projectId } = req.params as { projectId: string };
+    const q = req.query as { type?: string };
+
+    const type = q.type ? asArtifactType(q.type) : undefined;
+    return { artifacts: await listArtifacts(projectId, type) };
+  });
+
+  app.put("/v1/projects/:projectId/artifacts/:type/:name", async (req) => {
+    const { projectId, type, name } = req.params as {
+      projectId: strin
