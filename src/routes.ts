@@ -28,69 +28,69 @@ const DEFAULT_PROJECT_NAME = "default";
 const DEFAULT_STYLE_PROFILE_NAME = "prowriter_default";
 
 /**
- * This is not "example" text — it's the default operating style for ProWriter.
- * It gets seeded once into the DB so the GPT can always reference it.
+ * Default operating style for ProWriter.
+ * Seeded once into the DB so the GPT can reference it consistently.
+ *
+ * Goal: grounded, clear, concise, active, no "writerly fog", no cliché.
  */
 const DEFAULT_STYLE_PROFILE = {
   schema_version: 1,
-  label: "ProWriter Default (clarity + purpose-first)",
+  label: "ProWriter Default (clear, grounded, purposeful)",
   influences: [],
   rhythm: {
     sentence_length_bias:
-      "Bias toward short/medium sentences; use a longer sentence only when it increases tension or reveals a thought-turn.",
+      "Prefer short/medium sentences. Use a longer sentence only when it increases tension or delivers a deliberate thought-turn.",
     punctuation_habits:
-      "Prefer clean punctuation. Avoid em-dash chains and rhetorical fragments unless voice demands it.",
-    paragraphing: "Paragraphs are action units. Break on a turn: decision, reveal, power shift, sensory interrupt."
+      "Clean punctuation. Avoid em-dash chains, rhetorical fragments, and breathless cadence unless the POV voice demands it.",
+    paragraphing:
+      "Paragraphs are action units. Break on a turn: decision, reveal, escalation, or consequence. No static paragraphs."
   },
   diction: {
-    register: "Natural, contemporary, concrete. No pseudo-literary inflation.",
-    concreteness_bias: "Prefer observable behavior and specific objects over abstract labels.",
-    verb_energy: "Strong verbs over adverbs. Make motion legible.",
-    adjective_policy: "One precise modifier beats three decorative ones."
+    register:
+      "Plainspoken, precise, concrete. Use simple language whenever possible. Avoid inflated literary phrasing.",
+    concreteness_bias:
+      "Write what can be seen, heard, touched, done, decided. Replace abstract labels with observable behavior and specific objects.",
+    verb_energy:
+      "Active voice by default. Strong verbs over adverbs. Make motion, intent, and cause-and-effect obvious.",
+    adjective_policy:
+      "Minimal modifiers. Use one precise adjective only when it changes meaning. If it’s decorative, cut it."
   },
   imagery_and_metaphor: {
-    purpose: "Metaphor is allowed only to clarify emotion, power dynamics, or sensory reality—not to decorate.",
-    when_used: "Use metaphor at turning points: realization, escalation, reversal, controlled breath after impact.",
-    how_used: "Brief, concrete, anchored to POV character’s world. No cosmic abstraction.",
-    metaphor_budget: "Max 1 metaphor per paragraph, and it must earn its place.",
-    disallowed: ["cosmic abstraction", "vague existential fog", "meaningless 'like a dream' phrasing", "random body-poetry"]
-  },
-  description_strategy: {
-    focus: "Describe what matters to the scene objective: threat, desire, leverage, evidence, escape routes.",
-    omissions: "Skip neutral detail unless it raises tension or reveals character.",
-    pacing: "If tension rises, compress description into sharp specifics. If tension drops, the writing must still change something."
-  },
-  theme_handling: {
-    approach: "Let themes emerge through choices, consequences, and repeated pressures—not speeches.",
-    recurrence_signals: "Use recurring objects, behaviors, and dilemmas rather than repeated statements."
-  },
-  pov_behavior: {
-    distance: "Close enough to feel thought; far enough to keep action clean.",
-    interiority: "Interiority must create a choice, a lie, or a contradiction—not commentary.",
-    reliability: "If unreliable, show bias via selective detail rather than confusion."
-  },
-  dialogue_behavior: {
-    subtext_rules: "Dialogue must have leverage. People avoid saying the real thing unless cornered.",
-    escalation_patterns: "Each exchange changes power: concession, threat, reveal, trap.",
-    exposition_hiding: "Hide exposition inside conflict: accusation, bargaining, misdirection, insult, confession."
+    purpose:
+      "Metaphor is allowed only if it clarifies emotion, power dynamics, or sensory reality. Never decorative.",
+    when_used:
+      "Use metaphor only at turning points (realization, escalation, reversal) and keep it brief and grounded.",
+    how_used:
+      "Concrete, physical, anchored to the POV character’s lived world. No cosmic abstraction. If it can’t be stated literally, it doesn’t belong.",
+    metaphor_budget:
+      "Default 0 metaphors per paragraph. If used, max 1, and it must earn its place by increasing clarity or tension.",
+    disallowed: [
+      "cliché metaphors",
+      "cosmic/generalized abstraction (universe, abyss, eternity, void, darkness-as-mood)",
+      "dreamlike/fog/shattered/whispered-into-the-night phrasing",
+      "metaphor that does not translate cleanly into literal meaning"
+    ]
   },
   constraints: {
-    must_avoid: ["filler reactions", "generic emotion labels without behavior", "metaphors that don't clarify", "AI-sounding symmetry"],
-    must_include: ["specific actions", "cause-and-effect clarity", "a turn per paragraph or per beat"],
-    rating_boundaries: "Follow user boundaries. Default: adult themes allowed, no explicit sexual content unless user requests."
-  },
-  application_rules: [
-    {
-      why: "Readers trust scenes that track physical reality and intent.",
-      when: "At the start of each paragraph and each dialogue exchange.",
-      how: "State who does what, what changes, and what it means for the objective."
-    },
-    {
-      why: "Marketable prose is clear, tense, and selective.",
-      when: "Anytime a passage feels writerly or indulgent.",
-      how: "Cut the pretty sentence unless it increases tension, reveals character, or sharpens meaning."
-    }
-  ]
+    must_avoid: [
+      "clichés",
+      "throat-clearing and filler",
+      "generic emotion labels without behavior",
+      "passive voice unless the agent is unknown/hidden on purpose",
+      "abstract commentary that does not affect action or choice",
+      "symmetrical AI cadence and over-balanced sentences",
+      "decorative metaphor"
+    ],
+    must_include: [
+      "show-dont-tell via behavior + concrete detail + consequence",
+      "active verbs and clear agents",
+      "every sentence does work (action, tension, character, necessary info, or change)",
+      "cause-and-effect clarity",
+      "only relevant detail (no neutral description)"
+    ],
+    rating_boundaries:
+      "Follow user boundaries. Default: grounded adult themes allowed; avoid explicit sexual content unless the user explicitly requests it."
+  }
 } as const;
 
 function badRequest(message: string): never {
@@ -133,7 +133,7 @@ async function ensureDefaultStyleProfile(projectId: string): Promise<void> {
       payload: DEFAULT_STYLE_PROFILE
     });
   } catch {
-    // In case of a race on first boot (two requests at once), ignore.
+    // Race on first boot (two requests at once). Safe to ignore.
   }
 }
 
@@ -345,48 +345,53 @@ export async function registerRoutes(app: FastifyInstance) {
     const mode = reqData.mode;
 
     const rubricBase: string[] = [
-      "Preserve meaning and intent unless explicitly told to change it",
+      "Clarity beats beauty; rewrite anything that is pretty but unclear",
+      "Show, don't tell (behavior + concrete detail + consequence)",
+      "Prefer active voice and strong verbs; cut unnecessary adverbs",
+      "Use simple language whenever possible; avoid inflated phrasing",
+      "Cut filler and redundant qualifiers aggressively",
+      "Avoid clichés completely",
+      "Every sentence must do work (action, tension, character, necessary info, or change)",
       "Maintain continuity and avoid inventing new facts",
-      "Prefer concrete verbs and observable behavior over vague abstraction",
       "Ensure cause-and-effect is clear at the paragraph level",
-      "Remove filler phrases and avoid decorative metaphor that does not clarify"
+      "Remove decorative metaphor that does not clarify meaning"
     ];
 
     const modeRubric: Record<string, string[]> = {
       humanize: [
-        "Increase specificity of human behavior and subtext without melodrama",
-        "Replace generic reactions with character-specific reactions",
+        "Replace generic reactions with character-specific behavior and subtext",
+        "Avoid melodrama; keep emotional shifts motivated by events",
         "Keep voice consistent and avoid robotic symmetry"
       ],
       marketability: [
-        "Tighten openings and transitions; reduce throat-clearing",
-        "Sharpen stakes and objective; make tension legible early",
-        "Favor clarity and pacing over ornamental language"
+        "Tighten openings and transitions; remove throat-clearing",
+        "Sharpen objective, obstacle, and stakes early",
+        "Prioritize readability and tension over ornament"
       ],
       tighten: [
-        "Remove redundancy and tighten sentences without losing voice",
-        "Prefer one strong image over multiple weaker images",
-        "Avoid over-explaining what the reader can infer"
+        "Remove redundancy without losing meaning",
+        "Compress neutral description; keep only relevant details",
+        "Prefer one precise image over several weaker ones"
       ],
       voice_match: [
         "Align diction and rhythm to the chosen style constraints",
-        "Keep metaphor budget controlled and purposeful",
-        "Avoid imitation-by-copy; apply techniques, not wording"
+        "Apply techniques without copying phrasing",
+        "Keep metaphor budget near zero unless it clarifies"
       ],
       clarity: [
         "Disambiguate pronouns and causal links",
         "Ground setting and action so the reader can visualize sequence",
-        "Reduce abstract nouns in favor of concrete actions"
+        "Replace abstract nouns with concrete actions"
       ],
       dialogue_punchup: [
-        "Make dialogue do work: subtext, leverage, concealment, escalation",
-        "Avoid on-the-nose exposition",
-        "Track who has power in each exchange"
+        "Dialogue must have leverage and subtext",
+        "Avoid on-the-nose exposition; hide info inside conflict",
+        "Track power shifts per exchange"
       ],
       pacing: [
-        "Compress low-tension passages and expand high-tension turns",
-        "Turn summaries into scene beats when tension depends on it",
-        "End on a change: decision, revelation, reversal, or escalation"
+        "Compress low-tension passages; expand high-tension turns",
+        "End on change: decision, reveal, reversal, escalation",
+        "Make each paragraph move the situation"
       ]
     };
 
@@ -397,8 +402,9 @@ export async function registerRoutes(app: FastifyInstance) {
       risks_to_avoid: [
         "Vague sensory filler",
         "Unmotivated emotional swings",
-        "Metaphor that does not clarify action, feeling, or power dynamics",
-        "Continuity contradictions"
+        "Abstract metaphors that do not clarify",
+        "Continuity contradictions",
+        "Cliché phrasing"
       ],
       recommended_passes: ["Continuity pass", "Clarity pass", "Pacing pass", "Line-level tightening pass"]
     };
@@ -442,7 +448,7 @@ export async function registerRoutes(app: FastifyInstance) {
       issues.push({
         severity: "warn",
         category: "rhythm",
-        message: "Average sentence length is high; consider tightening or varying cadence"
+        message: "Sentences run long; tighten and vary cadence"
       });
     }
 
@@ -450,7 +456,7 @@ export async function registerRoutes(app: FastifyInstance) {
       issues.push({
         severity: "warn",
         category: "filler",
-        message: "Detected common filler phrases; replace with character-specific action or omission"
+        message: "Filler detected; cut throat-clearing and replace generic reactions with specific action"
       });
     }
 
@@ -458,7 +464,7 @@ export async function registerRoutes(app: FastifyInstance) {
       issues.push({
         severity: "warn",
         category: "clarity",
-        message: "Detected vague language; increase specificity and observable behavior"
+        message: "Abstract/vague language detected; replace with concrete behavior and specific detail"
       });
     }
 
@@ -467,7 +473,7 @@ export async function registerRoutes(app: FastifyInstance) {
       issues.push({
         severity: "info",
         category: "clarity",
-        message: "Adverb density may be high; consider replacing with stronger verbs"
+        message: "Adverb density may be high; consider stronger verbs and cleaner clauses"
       });
     }
 
