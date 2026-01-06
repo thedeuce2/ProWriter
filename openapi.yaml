@@ -1,84 +1,52 @@
-openapi: 3.0.1
+openapi: 3.1.0
 info:
-  title: Writing Collaborator Actions Backend
-  version: 0.2.0
-  description: >
-    REST API intended to be used as GPT Actions for a Custom GPT writing collaborator.
-    This API stores validated writing artifacts (style profiles, character sheets, draft directives,
-    revision plans, quality reports) and provides deterministic prose diagnostics.
+  title: ProWriter Backend Actions
+  version: 1.0.4
 servers:
-  - url: https://YOUR_DOMAIN_HERE
-    description: Production
-  - url: http://localhost:8787
-    description: Local
+  - url: https://prowriter-4jdv.onrender.com
 
 paths:
   /health:
     get:
-      operationId: health
+      operationId: healthCheck
       summary: Health check
-      security: []
       responses:
         "200":
           description: OK
-
-  /openapi.yaml:
-    get:
-      operationId: getOpenApiYaml
-      summary: Fetch OpenAPI YAML for debugging
-      security: []
-      responses:
-        "200":
-          description: YAML
-
-  /v1/projects:
-    post:
-      operationId: createProject
-      summary: Create a project
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ProjectCreate"
-      responses:
-        "200":
-          description: Created
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProjectCreateResponse"
+                $ref: "#/components/schemas/HealthResponse"
+
+  /:
     get:
-      operationId: listProjects
-      summary: List projects
+      operationId: serviceInfo
+      summary: Service info
       responses:
         "200":
-          description: List
+          description: Info
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProjectListResponse"
+                $ref: "#/components/schemas/GenericObjectResponse"
 
-  /v1/projects/{projectId}/canon-digest:
+  /v1/canon-digest:
     get:
       operationId: getCanonDigest
-      summary: Get a lightweight canon digest
-      parameters:
-        - $ref: "#/components/parameters/ProjectId"
+      summary: List available canon artifacts in the default project
       responses:
         "200":
           description: Digest
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CanonDigest"
+                $ref: "#/components/schemas/CanonDigestResponse"
 
-  /v1/projects/{projectId}/artifacts:
+  /v1/artifacts:
     get:
       operationId: listArtifacts
-      summary: List artifacts
+      summary: List artifacts (default project), optionally filtered by type
       parameters:
-        - $ref: "#/components/parameters/ProjectId"
         - name: type
           in: query
           required: false
@@ -86,83 +54,75 @@ paths:
             $ref: "#/components/schemas/ArtifactType"
       responses:
         "200":
-          description: List
+          description: Artifacts
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ArtifactListResponse"
 
-  /v1/projects/{projectId}/artifacts/{type}/{name}:
+  /v1/artifacts/{type}/{artifactName}:
     put:
-      operationId: upsertArtifact
-      summary: Create or update an artifact (typed by path)
+      operationId: upsertGenericArtifact
+      summary: Upsert an artifact (default project)
       parameters:
-        - $ref: "#/components/parameters/ProjectId"
         - name: type
           in: path
           required: true
           schema:
             $ref: "#/components/schemas/ArtifactType"
-        - name: name
+        - name: artifactName
           in: path
           required: true
-          schema:
-            type: string
-            minLength: 1
+          schema: { type: string }
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/ArtifactUpsert"
+              $ref: "#/components/schemas/ArtifactUpsertRequest"
       responses:
         "200":
           description: Upserted
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactWriteResponse"
+                $ref: "#/components/schemas/GenericObjectResponse"
+
     get:
-      operationId: getArtifact
-      summary: Get latest version of an artifact
+      operationId: getGenericArtifactLatest
+      summary: Get latest artifact (default project)
       parameters:
-        - $ref: "#/components/parameters/ProjectId"
         - name: type
           in: path
           required: true
           schema:
             $ref: "#/components/schemas/ArtifactType"
-        - name: name
+        - name: artifactName
           in: path
           required: true
-          schema:
-            type: string
-            minLength: 1
+          schema: { type: string }
       responses:
         "200":
-          description: Artifact
+          description: Latest
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactReadResponse"
+                $ref: "#/components/schemas/GenericObjectResponse"
 
-  /v1/projects/{projectId}/artifacts/{type}/{name}/revisions:
+  /v1/artifacts/{type}/{artifactName}/revisions:
     get:
-      operationId: listArtifactRevisions
-      summary: List revisions for an artifact
+      operationId: listGenericArtifactRevisions
+      summary: List revisions for an artifact (default project)
       parameters:
-        - $ref: "#/components/parameters/ProjectId"
         - name: type
           in: path
           required: true
           schema:
             $ref: "#/components/schemas/ArtifactType"
-        - name: name
+        - name: artifactName
           in: path
           required: true
-          schema:
-            type: string
-            minLength: 1
+          schema: { type: string }
       responses:
         "200":
           description: Revisions
@@ -171,44 +131,41 @@ paths:
               schema:
                 $ref: "#/components/schemas/ArtifactRevisionListResponse"
 
-  /v1/projects/{projectId}/artifacts/{type}/{name}/revisions/{revision}:
+  /v1/artifacts/{type}/{artifactName}/revisions/{revisionNumber}:
     get:
-      operationId: getArtifactRevision
-      summary: Get a specific revision of an artifact
+      operationId: getGenericArtifactRevision
+      summary: Get a specific revision for an artifact (default project)
       parameters:
-        - $ref: "#/components/parameters/ProjectId"
         - name: type
           in: path
           required: true
           schema:
             $ref: "#/components/schemas/ArtifactType"
-        - name: name
+        - name: artifactName
           in: path
           required: true
-          schema:
-            type: string
-            minLength: 1
-        - name: revision
+          schema: { type: string }
+        - name: revisionNumber
           in: path
           required: true
-          schema:
-            type: integer
-            minimum: 1
+          schema: { type: integer, minimum: 1 }
       responses:
         "200":
           description: Revision
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactReadResponse"
+                $ref: "#/components/schemas/GenericObjectResponse"
 
-  /v1/projects/{projectId}/style-profiles/{name}:
+  /v1/style-profiles/{profileName}:
     put:
       operationId: upsertStyleProfile
-      summary: Create or update a style profile
+      summary: Upsert a style profile (default project)
       parameters:
-        - $ref: "#/components/parameters/ProjectId"
-        - $ref: "#/components/parameters/Name"
+        - name: profileName
+          in: path
+          required: true
+          schema: { type: string }
       requestBody:
         required: true
         content:
@@ -221,28 +178,33 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactWriteResponse"
+                $ref: "#/components/schemas/GenericObjectResponse"
+
     get:
       operationId: getStyleProfile
-      summary: Get latest style profile
+      summary: Get latest style profile (default project)
       parameters:
-        - $ref: "#/components/parameters/ProjectId"
-        - $ref: "#/components/parameters/Name"
+        - name: profileName
+          in: path
+          required: true
+          schema: { type: string }
       responses:
         "200":
-          description: Style profile
+          description: Latest
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactReadResponse"
+                $ref: "#/components/schemas/GenericObjectResponse"
 
-  /v1/projects/{projectId}/character-sheets/{name}:
+  /v1/character-sheets/{sheetName}:
     put:
       operationId: upsertCharacterSheet
-      summary: Create or update a character sheet
+      summary: Upsert a character sheet (default project)
       parameters:
-        - $ref: "#/components/parameters/ProjectId"
-        - $ref: "#/components/parameters/Name"
+        - name: sheetName
+          in: path
+          required: true
+          schema: { type: string }
       requestBody:
         required: true
         content:
@@ -255,33 +217,34 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactWriteResponse"
+                $ref: "#/components/schemas/GenericObjectResponse"
+
     get:
       operationId: getCharacterSheet
-      summary: Get latest character sheet
+      summary: Get latest character sheet (default project)
       parameters:
-        - $ref: "#/components/parameters/ProjectId"
-        - $ref: "#/components/parameters/Name"
+        - name: sheetName
+          in: path
+          required: true
+          schema: { type: string }
       responses:
         "200":
-          description: Character sheet
+          description: Latest
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactReadResponse"
+                $ref: "#/components/schemas/GenericObjectResponse"
 
-  /v1/projects/{projectId}/draft-directives:
+  /v1/draft-directives:
     post:
-      operationId: saveDraftDirective
-      summary: Save a draft directive
+      operationId: createDraftDirective
+      summary: Store a draft directive as an artifact (default project)
       parameters:
-        - $ref: "#/components/parameters/ProjectId"
-        - name: name
+        - name: directiveName
           in: query
           required: false
-          schema:
-            type: string
-            minLength: 1
+          schema: { type: string }
+          description: Optional name; defaults to "current" on the server
       requestBody:
         required: true
         content:
@@ -290,24 +253,22 @@ paths:
               $ref: "#/components/schemas/DraftDirective"
       responses:
         "200":
-          description: Saved
+          description: Stored
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactWriteResponse"
+                $ref: "#/components/schemas/GenericObjectResponse"
 
-  /v1/projects/{projectId}/revision-plans:
+  /v1/revision-plans:
     post:
       operationId: createRevisionPlan
-      summary: Create and save a deterministic revision plan rubric
+      summary: Generate/store a revision plan (default project)
       parameters:
-        - $ref: "#/components/parameters/ProjectId"
-        - name: name
+        - name: planName
           in: query
           required: false
-          schema:
-            type: string
-            minLength: 1
+          schema: { type: string }
+          description: Optional name; defaults to "current" on the server
       requestBody:
         required: true
         content:
@@ -316,18 +277,16 @@ paths:
               $ref: "#/components/schemas/RevisionPlanRequest"
       responses:
         "200":
-          description: Saved
+          description: Stored
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactWriteResponse"
+                $ref: "#/components/schemas/GenericObjectResponse"
 
-  /v1/projects/{projectId}/diagnostics/prose:
+  /v1/diagnostics/prose:
     post:
-      operationId: diagnoseProse
-      summary: Analyze prose deterministically and save latest quality report
-      parameters:
-        - $ref: "#/components/parameters/ProjectId"
+      operationId: proseDiagnostics
+      summary: Run prose diagnostics and store a quality report (default project)
       requestBody:
         required: true
         content:
@@ -336,90 +295,60 @@ paths:
               $ref: "#/components/schemas/ProseDiagnosticRequest"
       responses:
         "200":
-          description: Saved
+          description: Stored
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactWriteResponse"
+                $ref: "#/components/schemas/GenericObjectResponse"
+
+  /v1/projects:
+    post:
+      operationId: createProject
+      summary: Create a project (optional; ProWriter does not require this)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectCreateRequest"
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectCreateResponse"
+
+    get:
+      operationId: listProjects
+      summary: List projects (optional)
+      responses:
+        "200":
+          description: Projects
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectListResponse"
 
 components:
-  parameters:
-    ProjectId:
-      name: projectId
-      in: path
-      required: true
-      schema:
-        type: string
-        minLength: 1
-    Name:
-      name: name
-      in: path
-      required: true
-      schema:
-        type: string
-        minLength: 1
-
   schemas:
-    ProjectCreate:
+    # --- validator-friendly generic object ---
+    GenericObjectResponse:
       type: object
-      additionalProperties: false
+      description: Generic object response (placeholder property included for strict validators).
       properties:
-        name:
+        _:
           type: string
-          minLength: 1
-          maxLength: 200
+          description: Placeholder property
+      additionalProperties: true
 
-    ProjectCreateResponse:
+    HealthResponse:
       type: object
       additionalProperties: false
-      required: [project_id]
       properties:
-        project_id:
-          type: string
-
-    ProjectListResponse:
-      type: object
-      additionalProperties: false
-      required: [projects]
-      properties:
-        projects:
-          type: array
-          items:
-            type: object
-            additionalProperties: false
-            required: [project_id, created_at, updated_at]
-            properties:
-              project_id:
-                type: string
-              name:
-                type: string
-                nullable: true
-              created_at:
-                type: string
-                format: date-time
-              updated_at:
-                type: string
-                format: date-time
-
-    CanonDigest:
-      type: object
-      additionalProperties: false
-      required: [project_id, style_profiles, characters, draft_directives]
-      properties:
-        project_id:
-          type: string
-        style_profiles:
-          type: array
-          items:
-            type: string
-        characters:
-          type: array
-          items:
-            type: string
-        draft_directives:
-          type: array
-          items:
-            type: string
+        ok:
+          type: boolean
+      required: [ok]
 
     ArtifactType:
       type: string
@@ -431,488 +360,174 @@ components:
         - quality_report
         - freeform_note
 
-    ArtifactUpsert:
+    ArtifactSummary:
       type: object
       additionalProperties: false
-      required: [schema_version, payload]
       properties:
-        schema_version:
-          type: integer
-          minimum: 1
-        payload:
-          type: object
-
-    ArtifactWriteResponse:
-      type: object
-      additionalProperties: false
-      required: [artifact_id, type, name, schema_version, revision]
-      properties:
-        artifact_id:
-          type: string
         type:
           $ref: "#/components/schemas/ArtifactType"
         name:
           type: string
         schema_version:
           type: integer
-        revision:
-          type: integer
-
-    ArtifactReadResponse:
-      type: object
-      additionalProperties: false
-      properties:
-        error:
+        updated_at:
           type: string
-        artifact_id:
-          type: string
-        type:
-          $ref: "#/components/schemas/ArtifactType"
-        name:
-          type: string
-        schema_version:
-          type: integer
-        revision:
-          type: integer
-        payload:
-          type: object
+          format: date-time
+      required: [type, name, schema_version, updated_at]
 
     ArtifactListResponse:
       type: object
       additionalProperties: false
-      required: [artifacts]
       properties:
         artifacts:
           type: array
           items:
-            type: object
-            additionalProperties: false
-            required: [artifact_id, type, name, schema_version, created_at, updated_at]
-            properties:
-              artifact_id:
-                type: string
-              type:
-                $ref: "#/components/schemas/ArtifactType"
-              name:
-                type: string
-              schema_version:
-                type: integer
-              created_at:
-                type: string
-                format: date-time
-              updated_at:
-                type: string
-                format: date-time
+            $ref: "#/components/schemas/ArtifactSummary"
+      required: [artifacts]
 
     ArtifactRevisionListResponse:
       type: object
       additionalProperties: false
       properties:
-        error:
-          type: string
         revisions:
           type: array
           items:
             type: object
             additionalProperties: false
-            required: [revision, created_at]
             properties:
-              revision:
+              revision_number:
                 type: integer
+                minimum: 1
               created_at:
                 type: string
                 format: date-time
+            required: [revision_number, created_at]
+      required: [revisions]
 
-    CharacterSheet:
+    ArtifactUpsertRequest:
       type: object
       additionalProperties: false
-      required: [schema_version, name]
       properties:
         schema_version:
           type: integer
           minimum: 1
-        name:
+        payload:
+          type: object
+          description: JSON payload for this artifact
+          properties:
+            _:
+              type: string
+          additionalProperties: true
+      required: [schema_version, payload]
+
+    CanonDigestResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        project_id:
           type: string
-          minLength: 1
-          maxLength: 200
-        role_in_story:
-          type: string
-          minLength: 1
-          maxLength: 500
-        pronouns:
-          type: string
-          minLength: 1
-          maxLength: 50
-        age:
-          type: integer
-          minimum: 0
-          maximum: 130
-        physical:
-          type: string
-          minLength: 1
-          maxLength: 2000
-        voice:
-          type: string
-          minLength: 1
-          maxLength: 2000
-        background:
-          type: string
-          minLength: 1
-          maxLength: 4000
-        wants:
+        style_profiles:
           type: array
-          items:
-            type: string
-            minLength: 1
-            maxLength: 500
-        fears:
+          items: { type: string }
+        characters:
           type: array
-          items:
-            type: string
-            minLength: 1
-            maxLength: 500
-        contradictions:
+          items: { type: string }
+        draft_directives:
           type: array
-          items:
-            type: string
-            minLength: 1
-            maxLength: 500
-        relationships:
-          type: array
-          items:
-            type: object
-            additionalProperties: false
-            required: [other_name, relationship]
-            properties:
-              other_name:
-                type: string
-                minLength: 1
-                maxLength: 200
-              relationship:
-                type: string
-                minLength: 1
-                maxLength: 500
-        notes:
-          type: string
-          minLength: 1
-          maxLength: 6000
+          items: { type: string }
+      required: [project_id, style_profiles, characters, draft_directives]
 
     StyleProfile:
       type: object
-      additionalProperties: false
-      required: [schema_version, label]
+      additionalProperties: true
       properties:
-        schema_version:
-          type: integer
-          minimum: 1
-        label:
-          type: string
-          minLength: 1
-          maxLength: 200
-        influences:
-          type: array
-          items:
-            type: string
-            minLength: 1
-            maxLength: 200
-        rhythm:
-          type: object
-          additionalProperties: false
-          properties:
-            sentence_length_bias:
-              type: string
-              minLength: 1
-              maxLength: 500
-            punctuation_habits:
-              type: string
-              minLength: 1
-              maxLength: 1000
-            paragraphing:
-              type: string
-              minLength: 1
-              maxLength: 1000
-        diction:
-          type: object
-          additionalProperties: false
-          properties:
-            register:
-              type: string
-              minLength: 1
-              maxLength: 500
-            concreteness_bias:
-              type: string
-              minLength: 1
-              maxLength: 500
-            verb_energy:
-              type: string
-              minLength: 1
-              maxLength: 500
-            adjective_policy:
-              type: string
-              minLength: 1
-              maxLength: 500
-        imagery_and_metaphor:
-          type: object
-          additionalProperties: false
-          properties:
-            purpose:
-              type: string
-              minLength: 1
-              maxLength: 1500
-            when_used:
-              type: string
-              minLength: 1
-              maxLength: 1500
-            how_used:
-              type: string
-              minLength: 1
-              maxLength: 1500
-            metaphor_budget:
-              type: string
-              minLength: 1
-              maxLength: 500
-            disallowed:
-              type: array
-              items:
-                type: string
-                minLength: 1
-                maxLength: 200
-        description_strategy:
-          type: object
-          additionalProperties: false
-          properties:
-            focus:
-              type: string
-              minLength: 1
-              maxLength: 1500
-            omissions:
-              type: string
-              minLength: 1
-              maxLength: 1500
-            pacing:
-              type: string
-              minLength: 1
-              maxLength: 1500
-        theme_handling:
-          type: object
-          additionalProperties: false
-          properties:
-            approach:
-              type: string
-              minLength: 1
-              maxLength: 1500
-            recurrence_signals:
-              type: string
-              minLength: 1
-              maxLength: 1500
-        pov_behavior:
-          type: object
-          additionalProperties: false
-          properties:
-            distance:
-              type: string
-              minLength: 1
-              maxLength: 1000
-            interiority:
-              type: string
-              minLength: 1
-              maxLength: 1000
-            reliability:
-              type: string
-              minLength: 1
-              maxLength: 1000
-        dialogue_behavior:
-          type: object
-          additionalProperties: false
-          properties:
-            subtext_rules:
-              type: string
-              minLength: 1
-              maxLength: 1500
-            escalation_patterns:
-              type: string
-              minLength: 1
-              maxLength: 1500
-            exposition_hiding:
-              type: string
-              minLength: 1
-              maxLength: 1500
-        constraints:
-          type: object
-          additionalProperties: false
-          properties:
-            must_avoid:
-              type: array
-              items:
-                type: string
-                minLength: 1
-                maxLength: 200
-            must_include:
-              type: array
-              items:
-                type: string
-                minLength: 1
-                maxLength: 200
-            rating_boundaries:
-              type: string
-              minLength: 1
-              maxLength: 300
-        application_rules:
-          type: array
-          items:
-            type: object
-            additionalProperties: false
-            required: [why, when, how]
-            properties:
-              why:
-                type: string
-                minLength: 1
-                maxLength: 1200
-              when:
-                type: string
-                minLength: 1
-                maxLength: 1200
-              how:
-                type: string
-                minLength: 1
-                maxLength: 1200
+        schema_version: { type: integer, minimum: 1 }
+        label: { type: string }
+      required: [schema_version, label]
+
+    CharacterSheet:
+      type: object
+      additionalProperties: true
+      properties:
+        schema_version: { type: integer, minimum: 1 }
+        name: { type: string }
+      required: [schema_version, name]
 
     DraftDirective:
       type: object
-      additionalProperties: false
-      required: [schema_version, deliverable, pov, tense, objective, conflict, stakes, beats]
+      additionalProperties: true
       properties:
-        schema_version:
-          type: integer
-          minimum: 1
+        schema_version: { type: integer, minimum: 1 }
         deliverable:
           type: string
           enum: [scene, chapter, cold_open, synopsis, pitch, query_letter, outline]
-        pov:
-          type: string
-          minLength: 1
-          maxLength: 200
+        pov: { type: string }
         tense:
           type: string
           enum: [past, present]
-        target_length_min:
-          type: integer
-          minimum: 1
-        target_length_max:
-          type: integer
-          minimum: 1
-        objective:
-          type: string
-          minLength: 1
-          maxLength: 1200
-        conflict:
-          type: string
-          minLength: 1
-          maxLength: 1200
-        stakes:
-          type: string
-          minLength: 1
-          maxLength: 1200
+        objective: { type: string }
+        conflict: { type: string }
+        stakes: { type: string }
         beats:
           type: array
-          minItems: 1
           items:
             type: object
-            additionalProperties: false
-            required: [purpose, event]
+            additionalProperties: true
             properties:
-              purpose:
-                type: string
-                minLength: 1
-                maxLength: 500
-              event:
-                type: string
-                minLength: 1
-                maxLength: 2000
-              outcome:
-                type: string
-                minLength: 1
-                maxLength: 1000
-        dialogue_intent:
-          type: string
-          minLength: 1
-          maxLength: 1200
-        style_constraints:
-          type: array
-          items:
-            type: string
-            minLength: 1
-            maxLength: 400
-        must_include:
-          type: array
-          items:
-            type: string
-            minLength: 1
-            maxLength: 400
-        must_avoid:
-          type: array
-          items:
-            type: string
-            minLength: 1
-            maxLength: 400
-        continuity_requirements:
-          type: array
-          items:
-            type: string
-            minLength: 1
-            maxLength: 600
+              purpose: { type: string }
+              event: { type: string }
+      required: [schema_version, deliverable, pov, tense, objective, conflict, stakes, beats]
 
     RevisionPlanRequest:
       type: object
       additionalProperties: false
-      required: [schema_version, mode]
       properties:
-        schema_version:
-          type: integer
-          minimum: 1
+        schema_version: { type: integer, minimum: 1 }
         mode:
           type: string
           enum: [humanize, marketability, tighten, voice_match, clarity, dialogue_punchup, pacing]
-        constraints:
-          type: array
-          items:
-            type: string
-            minLength: 1
-            maxLength: 400
-        target_audience:
-          type: string
-          minLength: 1
-          maxLength: 200
-        tone:
-          type: string
-          minLength: 1
-          maxLength: 200
-        pov:
-          type: string
-          minLength: 1
-          maxLength: 200
-        rating_boundaries:
-          type: string
-          minLength: 1
-          maxLength: 300
+      required: [schema_version, mode]
 
     ProseDiagnosticRequest:
       type: object
       additionalProperties: false
-      required: [schema_version, text]
       properties:
-        schema_version:
-          type: integer
-          minimum: 1
-        text:
-          type: string
-          minLength: 1
-          maxLength: 200000
-        directive_name:
-          type: string
-          minLength: 1
-          maxLength: 200
-        style_profile_name:
-          type: string
-          minLength: 1
-          maxLength: 200
+        schema_version: { type: integer, minimum: 1 }
+        text: { type: string, minLength: 1, maxLength: 200000 }
+        directive_name: { type: string }
+        style_profile_name: { type: string }
+      required: [schema_version, text]
+
+    ProjectCreateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string }
+      required: [name]
+
+    ProjectCreateResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        project_id: { type: string }
+      required: [project_id]
+
+    ProjectListResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        projects:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              project_id: { type: string }
+              name:
+                anyOf:
+                  - type: string
+                  - type: "null"
+              created_at: { type: string, format: date-time }
+              updated_at: { type: string, format: date-time }
+            required: [project_id, name, created_at, updated_at]
+      required: [projects]
