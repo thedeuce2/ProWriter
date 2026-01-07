@@ -127,6 +127,8 @@ const PERSONIFICATION_VERBS = [
   "held",
   "grabbed",
   "swallowed",
+  "claimed",
+  "answered",
   "breathed",
   "breathing",
   "pressed",
@@ -157,7 +159,8 @@ const BANNED_PHRASES = [
   "time stood still",
   "in the blink of an eye",
   "cold as ice",
-  "silence was deafening"
+  "silence was deafening",
+  "rotten at the core"
 ];
 
 const ABSTRACT_SIMILE_TARGETS = ["sin", "evil", "darkness", "the abyss", "death", "fate", "destiny"];
@@ -223,8 +226,8 @@ function generateDeAiReport(text: string): {
   const flags: DeAiFlag[] = [];
   const suggested_ops: DeAiEditOp[] = [];
 
-  // 1) rhetorical flourish: “didn’t just X — it Y”
-  const flourishRe = /\b(?:didn’t|didn't)\s+just\b[^—\n]{0,120}—\s*it\b/gi;
+  // A) rhetorical flourish: “didn’t just X — it Y”
+  const flourishRe = /\b(?:didn’t|didn't)\s+just\b[^—\n]{0,140}—\s*it\b/gi;
   const flourishSpans = spansForRegex(text, flourishRe);
   if (flourishSpans.length > 0) {
     flags.push({
@@ -235,7 +238,19 @@ function generateDeAiReport(text: string): {
     });
   }
 
-  // 2) personification: “the/a/an <noun> <human-ish verb>”
+  // B) filter phrasing: “you could taste/feel/hear/see …”
+  const filterRe = /\byou could (?:taste|feel|hear|see)\b/gi;
+  const filterSpans = spansForRegex(text, filterRe);
+  if (filterSpans.length > 0) {
+    flags.push({
+      kind: "rhetorical_frame",
+      severity: "warn",
+      message: 'Filter phrase detected ("you could ..."). Prefer direct sensory statements without the filter.',
+      spans: filterSpans
+    });
+  }
+
+  // C) personification: “the/a/an <noun> <human-ish verb>”
   const personificationRe = new RegExp(
     String.raw`\b(?:the|a|an)\s+[a-z][\w-]*(?:\s+[a-z][\w-]*){0,2}\s+(?:${PERSONIFICATION_VERBS
       .map(escapeRe)
@@ -253,7 +268,7 @@ function generateDeAiReport(text: string): {
     });
   }
 
-  // 3) anthropomorphic sound nouns (“wet gasp”, “a whisper”, etc.)
+  // D) anthropomorphic sound nouns (“wet sigh”, “a whisper”, etc.)
   const soundNounRe = new RegExp(
     String.raw`\b(?:${ANTHRO_SOUND_ADJ.map(escapeRe).join("|")})\s+(?:${ANTHRO_SOUND_NOUNS
       .map(escapeRe)
@@ -266,11 +281,11 @@ function generateDeAiReport(text: string): {
       kind: "personification",
       severity: "warn",
       message:
-        'Anthropomorphic sound noun detected (e.g., "gasp", "whisper"). Replace with neutral sound terms unless the subject is a person.',
+        'Anthropomorphic sound noun detected (e.g., "sigh", "gasp", "whisper"). Replace with neutral sound terms unless the subject is a person.',
       spans: soundSpans
     });
 
-    // conservative replacements
+    // conservative replacements (limited)
     for (const sp of soundSpans.slice(0, 25)) {
       const lower = sp.snippet.toLowerCase();
       if (lower.includes("whisper")) {
@@ -291,7 +306,7 @@ function generateDeAiReport(text: string): {
     }
   }
 
-  // 4) “whisper of …” construction
+  // E) “whisper of …” construction
   const whisperOfSpans = phraseSpans(text, "whisper of");
   if (whisperOfSpans.length > 0) {
     flags.push({
@@ -312,7 +327,7 @@ function generateDeAiReport(text: string): {
     }
   }
 
-  // 5) vague words
+  // F) vague language
   const vagueSpans: TextSpan[] = [];
   for (const w of VAGUE_WORDS) {
     const re = new RegExp(String.raw`\b${escapeRe(w)}\b`, "gi");
@@ -327,7 +342,7 @@ function generateDeAiReport(text: string): {
     });
   }
 
-  // 6) abstract similes: “like sin/fate/…”
+  // G) abstract similes: “like sin/fate/…”
   const abstractSimileRe = new RegExp(
     String.raw`\blike\s+(?:${ABSTRACT_SIMILE_TARGETS.map(escapeRe).join("|")})\b`,
     "gi"
@@ -338,12 +353,12 @@ function generateDeAiReport(text: string): {
       kind: "abstract_simile",
       severity: "warn",
       message:
-        "Abstract simile detected. Replace with a concrete comparison anchored to the POV character’s world (physical, practical, specific).",
+        "Abstract simile detected. Replace with a concrete comparison anchored to the POV character’s world.",
       spans: absSpans
     });
   }
 
-  // 7) moralizing taglines: “enough to damn you”
+  // H) moralizing taglines: “enough to damn you”
   const moralizingRe = new RegExp(
     String.raw`\benough\s+to\s+(?:${MORALIZING_TAGLINES.map(escapeRe).join("|")})\b`,
     "gi"
@@ -354,12 +369,12 @@ function generateDeAiReport(text: string): {
       kind: "abstract_simile",
       severity: "warn",
       message:
-        'Moralizing tagline detected (e.g., "enough to damn you"). Replace with literal consequence (what it does to the body, the plan, or the risk).',
+        'Moralizing tagline detected (e.g., "enough to damn you"). Replace with literal consequence (risk, cost, effect).',
       spans: moralSpans
     });
   }
 
-  // 8) hard-banned cliché phrases
+  // I) banned phrases / clichés
   const clicheSpans: TextSpan[] = [];
   for (const p of BANNED_PHRASES) clicheSpans.push(...phraseSpans(text, p));
   if (clicheSpans.length > 0) {
@@ -374,7 +389,7 @@ function generateDeAiReport(text: string): {
     }
   }
 
-  // 9) simple filler words (safe deletions)
+  // J) filler words
   const fillerTargets = ["very", "really", "just", "somehow"];
   const fillerSpans: TextSpan[] = [];
   for (const w of fillerTargets) {
@@ -398,7 +413,7 @@ function generateDeAiReport(text: string): {
     vague_language: vagueSpans.length,
     abstract_simile: absSpans.length + moralSpans.length,
     cliche: clicheSpans.length,
-    rhetorical_frame: flourishSpans.length,
+    rhetorical_frame: flourishSpans.length + filterSpans.length,
     filler: fillerSpans.length
   };
 
@@ -406,8 +421,8 @@ function generateDeAiReport(text: string): {
 }
 
 function applySafeDeAiOps(text: string, ops: DeAiEditOp[]): { text: string; applied: DeAiEditOp[] } {
-  // Conservative: apply deletes + only the limited “safe” replacements we generated.
-  const safe = ops.slice(0, 120);
+  // Conservative: apply deletes + only the limited replacements we generated.
+  const safe = ops.slice(0, 140);
   const sorted = safe.slice().sort((a, b) => b.span.start - a.span.start);
 
   let out = text;
@@ -431,7 +446,7 @@ function applySafeDeAiOps(text: string, ops: DeAiEditOp[]): { text: string; appl
 }
 
 /* -----------------------------
-   Core route helpers
+   Core helpers
 ------------------------------ */
 
 function badRequest(message: string): never {
@@ -470,7 +485,7 @@ async function ensureDefaultStyleProfile(projectId: string): Promise<void> {
       payload: DEFAULT_STYLE_PROFILE
     });
   } catch {
-    // If two requests race on first boot, one will win. Safe to ignore.
+    // race-safe
   }
 }
 
@@ -880,7 +895,7 @@ export async function registerRoutes(app: FastifyInstance) {
   });
 
   // -------------------------
-  // Optional multi-project routes (keep these)
+  // Optional multi-project routes
   // -------------------------
 
   app.post("/v1/projects", async (req) => {
