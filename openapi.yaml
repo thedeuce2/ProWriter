@@ -1,799 +1,661 @@
-import type { FastifyInstance } from "fastify";
-import fs from "node:fs";
-import path from "node:path";
-import { z } from "zod";
-
-import { prisma } from "./prisma.js";
-import { analyzeProse } from "./prose_diagnostics.js";
-import {
-  ProjectCreateSchema,
-  ProseDiagnosticRequestSchema,
-  RevisionPlanRequestSchema,
-  RevisionPlanSchema,
-  DraftDirectiveSchema,
-  StyleProfileSchema,
-  CharacterSheetSchema,
-  ArtifactTypeSchema,
-  ArtifactUpsertSchema
-} from "./validation.js";
-import type { ArtifactType } from "./types.js";
-import {
-  upsertArtifact,
-  getArtifactLatest,
-  listArtifacts,
-  listArtifactRevisions,
-  getArtifactRevision
-} from "./artifacts.js";
-
-const DEFAULT_PROJECT_NAME = "default";
-const DEFAULT_STYLE_PROFILE_NAME = "prowriter_default";
-
-/**
- * Default operating style for ProWriter.
- * Seeded once into the DB so the GPT can reference it consistently.
- *
- * Goal: grounded, clear, concise, active, no cliché, no abstract metaphor fog.
- */
-const DEFAULT_STYLE_PROFILE = {
-  schema_version: 1,
-  label: "ProWriter Default (clear, grounded, purposeful)",
-  influences: [],
-  rhythm: {
-    sentence_length_bias:
-      "Prefer short/medium sentences. Use a longer sentence only when it increases tension or delivers a deliberate thought-turn.",
-    punctuation_habits:
-      "Clean punctuation. Avoid em-dash chains, rhetorical fragments, and breathless cadence unless the POV voice demands it.",
-    paragraphing:
-      "Paragraphs are action units. Break on a turn: decision, reveal, escalation, consequence. No static paragraphs."
-  },
-  diction: {
-    register: "Simple language first. Concrete, precise. Avoid inflated literary phrasing.",
-    concreteness_bias:
-      "Write what can be seen, heard, touched, done, decided. Replace abstract labels with observable behavior and specific objects.",
-    verb_energy: "Active voice by default. Strong verbs over adverbs. Make cause-and-effect obvious.",
-    adjective_policy:
-      "Minimal modifiers. Use one precise adjective only when it changes meaning. If it’s decorative, cut it."
-  },
-  constraints: {
-    must_avoid: [
-      "clichés",
-      "throat-clearing and filler",
-      "generic emotion labels without behavior",
-      "passive voice unless agent is unknown/hidden on purpose",
-      "abstract commentary that does not affect action or choice",
-      "symmetrical AI cadence and over-balanced sentences",
-      "decorative metaphor",
-      "cosmic/generalized abstraction (universe, abyss, eternity, void, darkness-as-mood)",
-      "dreamlike/fog/shattered/whispered-into-the-night phrasing"
-    ],
-    must_include: [
-      "show-dont-tell via behavior + concrete detail + consequence",
-      "active verbs and clear agents",
-      "every sentence does work (action, tension, character, necessary info, or change)",
-      "cause-and-effect clarity",
-      "only relevant detail (no neutral description)"
-    ],
-    rating_boundaries:
-      "Follow user boundaries. Default: grounded adult themes allowed; avoid explicit sexual content unless the user explicitly requests it."
-  }
-} as const;
-
-/* -----------------------------
-   Deterministic "De-AI" Edit Helpers
-   (No LLM calls. Heuristic detection + safe deletions only.)
------------------------------- */
-
-type DeAiSeverity = "info" | "warn" | "error";
-type DeAiFlagKind = "personification" | "vague_language" | "abstract_simile" | "cliche" | "rhetorical_frame" | "filler";
-
-type TextSpan = {
-  start: number;
-  end: number;
-  snippet: string;
-};
-
-type DeAiFlag = {
-  kind: DeAiFlagKind;
-  severity: DeAiSeverity;
-  message: string;
-  spans: TextSpan[];
-};
-
-type DeAiEditOp = {
-  op: "delete" | "replace";
-  span: TextSpan;
-  replacement: string | null;
-  note: string;
-};
-
-const PERSONIFICATION_VERBS = ["begged", "whispered", "groaned", "sighed", "gasped", "moaned", "pleaded", "sang"];
-
-const VAGUE_WORDS = [
-  "somehow",
-  "suddenly",
-  "really",
-  "very",
-  "just",
-  "kind of",
-  "sort of",
-  "thing",
-  "stuff",
-  "wrong",
-  "strange",
-  "dark",
-  "beautiful"
-];
-
-const BANNED_PHRASES = [
-  "like a dream",
-  "like a nightmare",
-  "time stood still",
-  "in the blink of an eye",
-  "cold as ice",
-  "silence was deafening"
-];
-
-const ABSTRACT_SIMILE_TARGETS = ["sin", "evil", "darkness", "the abyss", "death", "fate", "destiny"];
-
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function clampSnippet(text: string, start: number, end: number): string {
-  const s = Math.max(0, start);
-  const e = Math.min(text.length, end);
-  return text.slice(s, e);
-}
-
-function spansForRegex(text: string, re: RegExp, maxMatches = 60): TextSpan[] {
-  const spans: TextSpan[] = [];
-  const global = re.global ? re : new RegExp(re.source, re.flags + "g");
-  let count = 0;
-
-  for (const m of text.matchAll(global)) {
-    const idx = m.index;
-    if (idx === undefined) continue;
-    const start = idx;
-    const end = start + m[0].length;
-    spans.push({ start, end, snippet: clampSnippet(text, start, end) });
-    count += 1;
-    if (count >= maxMatches) break;
-  }
-
-  return spans;
-}
-
-function phraseSpans(text: string, phrase: string, maxMatches = 40): TextSpan[] {
-  const spans: TextSpan[] = [];
-  const needle = phrase.toLowerCase();
-  const hay = text.toLowerCase();
-  let idx = 0;
-  let count = 0;
-
-  while (true) {
-    const found = hay.indexOf(needle, idx);
-    if (found === -1) break;
-    const start = found;
-    const end = found + phrase.length;
-    spans.push({ start, end, snippet: clampSnippet(text, start, end) });
-    idx = end;
-    count += 1;
-    if (count >= maxMatches) break;
-  }
-
-  return spans;
-}
-
-function generateDeAiReport(text: string): {
-  schema_version: 1;
-  counts: Record<string, number>;
-  flags: DeAiFlag[];
-  suggested_ops: DeAiEditOp[];
-} {
-  const flags: DeAiFlag[] = [];
-  const suggested_ops: DeAiEditOp[] = [];
-
-  // Personification: "the mud begged", "a creek groaned", etc.
-  const personificationRe = new RegExp(
-    String.raw`\b(?:the|a|an)\s+[a-z][\w-]*\s+(?:${PERSONIFICATION_VERBS.map(escapeRe).join("|")})\b`,
-    "gi"
-  );
-  const personSpans = spansForRegex(text, personificationRe);
-  if (personSpans.length > 0) {
-    flags.push({
-      kind: "personification",
-      severity: "warn",
-      message:
-        "Personification detected. Replace with literal physical behavior (what actually happens) rather than giving objects human intent.",
-      spans: personSpans
-    });
-  }
-
-  // Vague words
-  const vagueSpans: TextSpan[] = [];
-  for (const w of VAGUE_WORDS) {
-    const re = new RegExp(String.raw`\b${escapeRe(w)}\b`, "gi");
-    vagueSpans.push(...spansForRegex(text, re));
-  }
-  if (vagueSpans.length > 0) {
-    flags.push({
-      kind: "vague_language",
-      severity: "warn",
-      message: "Vague language detected. Replace with specific nouns/verbs or remove if it adds no meaning.",
-      spans: vagueSpans.slice(0, 80)
-    });
-  }
-
-  // Abstract similes: "like sin", "like fate", etc.
-  const abstractSimileRe = new RegExp(
-    String.raw`\blike\s+(?:${ABSTRACT_SIMILE_TARGETS.map(escapeRe).join("|")})\b`,
-    "gi"
-  );
-  const absSpans = spansForRegex(text, abstractSimileRe);
-  if (absSpans.length > 0) {
-    flags.push({
-      kind: "abstract_simile",
-      severity: "warn",
-      message:
-        "Abstract simile detected. Replace with a concrete comparison anchored to the POV character’s world (physical, practical, specific).",
-      spans: absSpans
-    });
-  }
-
-  // Hard-banned cliché phrases
-  const clicheSpans: TextSpan[] = [];
-  for (const p of BANNED_PHRASES) clicheSpans.push(...phraseSpans(text, p));
-  if (clicheSpans.length > 0) {
-    flags.push({
-      kind: "cliche",
-      severity: "error",
-      message: "Cliché phrase detected. Remove or replace with specific, original detail.",
-      spans: clicheSpans
-    });
-    for (const sp of clicheSpans.slice(0, 20)) {
-      suggested_ops.push({ op: "delete", span: sp, replacement: null, note: "Remove cliché phrase" });
-    }
-  }
-
-  // Rhetorical filter phrases: "you could taste it:", etc.
-  const rhetoricalRe = /\byou could (?:taste|feel|hear|see)\s+it\b\s*:?/gi;
-  const rhetSpans = spansForRegex(text, rhetoricalRe);
-  if (rhetSpans.length > 0) {
-    flags.push({
-      kind: "rhetorical_frame",
-      severity: "info",
-      message: 'Rhetorical filter phrase detected ("you could ..."). Prefer direct sensory statements without the filter.',
-      spans: rhetSpans
-    });
-  }
-
-  // Filler words (safe deletions)
-  const fillerTargets = ["very", "really", "just", "somehow"];
-  const fillerSpans: TextSpan[] = [];
-  for (const w of fillerTargets) {
-    const re = new RegExp(String.raw`\b${escapeRe(w)}\b`, "gi");
-    fillerSpans.push(...spansForRegex(text, re));
-  }
-  if (fillerSpans.length > 0) {
-    flags.push({
-      kind: "filler",
-      severity: "info",
-      message: "Filler detected. Remove unless it changes literal meaning.",
-      spans: fillerSpans.slice(0, 80)
-    });
-    for (const sp of fillerSpans.slice(0, 40)) {
-      suggested_ops.push({ op: "delete", span: sp, replacement: null, note: "Remove filler word" });
-    }
-  }
-
-  return {
-    schema_version: 1,
-    counts: {
-      personification: personSpans.length,
-      vague_language: vagueSpans.length,
-      abstract_simile: absSpans.length,
-      cliche: clicheSpans.length,
-      rhetorical_frame: rhetSpans.length,
-      filler: fillerSpans.length
-    },
-    flags,
-    suggested_ops
-  };
-}
-
-function applySafeDeAiOps(text: string, ops: DeAiEditOp[]): { text: string; applied: DeAiEditOp[] } {
-  // Only apply deletes (no replacements) to avoid changing meaning unpredictably.
-  const deletes = ops.filter((o) => o.op === "delete").slice(0, 80);
-
-  // Apply from end to start so indices stay valid.
-  const sorted = deletes.slice().sort((a, b) => b.span.start - a.span.start);
-
-  let out = text;
-  for (const op of sorted) {
-    out = out.slice(0, op.span.start) + out.slice(op.span.end);
-  }
-  return { text: out, applied: deletes };
-}
-
-/* -----------------------------
-   Core route helpers
------------------------------- */
-
-function badRequest(message: string): never {
-  const err = new Error(message);
-  // @ts-expect-error fastify reads statusCode
-  err.statusCode = 400;
-  throw err;
-}
-
-function asArtifactType(s: string): ArtifactType {
-  const parsed = ArtifactTypeSchema.safeParse(s);
-  if (!parsed.success) badRequest("Invalid artifact type");
-  return parsed.data;
-}
-
-function nonEmptyQueryString(value: unknown, fallback: string): string {
-  if (typeof value !== "string") return fallback;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : fallback;
-}
-
-async function ensureDefaultStyleProfile(projectId: string): Promise<void> {
-  const existing = await prisma.artifact.findFirst({
-    where: { projectId, type: "style_profile", name: DEFAULT_STYLE_PROFILE_NAME },
-    select: { id: true }
-  });
-
-  if (existing) return;
-
-  try {
-    await upsertArtifact({
-      projectId,
-      type: "style_profile",
-      name: DEFAULT_STYLE_PROFILE_NAME,
-      schemaVersion: 1,
-      payload: DEFAULT_STYLE_PROFILE
-    });
-  } catch {
-    // If two requests race on first boot, one will win. Safe to ignore.
-  }
-}
-
-async function getOrCreateDefaultProjectId(): Promise<string> {
-  const existing = await prisma.project.findFirst({
-    where: { name: DEFAULT_PROJECT_NAME }
-  });
-
-  const projectId = existing
-    ? existing.id
-    : (await prisma.project.create({ data: { name: DEFAULT_PROJECT_NAME } })).id;
-
-  await ensureDefaultStyleProfile(projectId);
-  return projectId;
-}
-
-/* -----------------------------
-   Routes
------------------------------- */
-
-export async function registerRoutes(app: FastifyInstance) {
-  // Deterministic error responses
-  app.setErrorHandler((error, _req, reply) => {
-    const status = (error as any).statusCode ?? 500;
-    reply.code(status).send({
-      error: status === 500 ? "internal_error" : "bad_request"
-    });
-  });
-
-  app.get("/health", async () => ({ ok: true }));
-
-  app.get("/", async () => ({
-    ok: true,
-    service: "prowriter-backend",
-    endpoints: ["/health", "/openapi.yaml"]
-  }));
-
-  app.get("/openapi.yaml", async (_req, reply) => {
-    const p = path.join(process.cwd(), "openapi.yaml");
-    if (!fs.existsSync(p)) {
-      reply.code(404).type("application/json").send({ error: "not_found" });
-      return;
-    }
-    const yml = fs.readFileSync(p, "utf8");
-    reply.type("text/yaml").send(yml);
-  });
-
-  // -------------------------
-  // Default-project routes (NO projectId required)
-  // -------------------------
-
-  app.get("/v1/canon-digest", async () => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const artifacts = await listArtifacts(projectId);
-
-    return {
-      project_id: projectId,
-      style_profiles: artifacts.filter((a) => a.type === "style_profile").map((a) => a.name),
-      characters: artifacts.filter((a) => a.type === "character_sheet").map((a) => a.name),
-      draft_directives: artifacts.filter((a) => a.type === "draft_directive").map((a) => a.name)
-    };
-  });
-
-  app.get("/v1/artifacts", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const q = req.query as { type?: string };
-
-    const type = q.type ? asArtifactType(q.type) : undefined;
-    return { artifacts: await listArtifacts(projectId, type) };
-  });
-
-  app.put("/v1/artifacts/:type/:name", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const { type, name } = req.params as { type: string; name: string };
-
-    const artifactType = asArtifactType(type);
-
-    const parsedBody = ArtifactUpsertSchema.safeParse(req.body);
-    if (!parsedBody.success) badRequest("Invalid artifact upsert body");
-    const body = parsedBody.data;
-
-    return upsertArtifact({
-      projectId,
-      type: artifactType,
-      name,
-      schemaVersion: body.schema_version,
-      payload: body.payload
-    });
-  });
-
-  app.get("/v1/artifacts/:type/:name", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const { type, name } = req.params as { type: string; name: string };
-
-    const artifactType = asArtifactType(type);
-
-    const latest = await getArtifactLatest({ projectId, type: artifactType, name });
-    if (!latest) return { error: "not_found" };
-    return latest;
-  });
-
-  app.get("/v1/artifacts/:type/:name/revisions", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const { type, name } = req.params as { type: string; name: string };
-
-    const artifactType = asArtifactType(type);
-
-    const list = await listArtifactRevisions({ projectId, type: artifactType, name });
-    if (!list) return { error: "not_found" };
-    return { revisions: list };
-  });
-
-  app.get("/v1/artifacts/:type/:name/revisions/:revision", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const { type, name, revision } = req.params as { type: string; name: string; revision: string };
-
-    const artifactType = asArtifactType(type);
-
-    const revNum = Number(revision);
-    if (!Number.isInteger(revNum) || revNum < 1) badRequest("revision must be a positive integer");
-
-    const item = await getArtifactRevision({
-      projectId,
-      type: artifactType,
-      name,
-      revision: revNum
-    });
-
-    if (!item) return { error: "not_found" };
-    return item;
-  });
-
-  app.put("/v1/style-profiles/:profileName", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const { profileName } = req.params as { profileName: string };
-
-    const parsed = StyleProfileSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid style profile");
-    const data = parsed.data;
-
-    return upsertArtifact({
-      projectId,
-      type: "style_profile",
-      name: profileName,
-      schemaVersion: data.schema_version,
-      payload: data
-    });
-  });
-
-  app.get("/v1/style-profiles/:profileName", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const { profileName } = req.params as { profileName: string };
-
-    const latest = await getArtifactLatest({ projectId, type: "style_profile", name: profileName });
-    if (!latest) return { error: "not_found" };
-    return latest;
-  });
-
-  app.put("/v1/character-sheets/:sheetName", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const { sheetName } = req.params as { sheetName: string };
-
-    const parsed = CharacterSheetSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid character sheet");
-    const data = parsed.data;
-
-    return upsertArtifact({
-      projectId,
-      type: "character_sheet",
-      name: sheetName,
-      schemaVersion: data.schema_version,
-      payload: data
-    });
-  });
-
-  app.get("/v1/character-sheets/:sheetName", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const { sheetName } = req.params as { sheetName: string };
-
-    const latest = await getArtifactLatest({ projectId, type: "character_sheet", name: sheetName });
-    if (!latest) return { error: "not_found" };
-    return latest;
-  });
-
-  app.post("/v1/draft-directives", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const q = req.query as { directiveName?: string };
-
-    const directiveName = nonEmptyQueryString(q.directiveName, "current");
-
-    const parsed = DraftDirectiveSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid draft directive");
-    const data = parsed.data;
-
-    return upsertArtifact({
-      projectId,
-      type: "draft_directive",
-      name: directiveName,
-      schemaVersion: data.schema_version,
-      payload: data
-    });
-  });
-
-  app.post("/v1/revision-plans", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-    const q = req.query as { planName?: string };
-
-    const planName = nonEmptyQueryString(q.planName, "current");
-
-    const parsed = RevisionPlanRequestSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid revision plan request");
-    const reqData = parsed.data;
-
-    const mode = reqData.mode;
-
-    const rubricBase: string[] = [
-      "Clarity beats beauty; rewrite anything that is pretty but unclear",
-      "Show, don't tell (behavior + concrete detail + consequence)",
-      "Prefer active voice and strong verbs; cut unnecessary adverbs",
-      "Use simple language whenever possible; avoid inflated phrasing",
-      "Cut filler and redundant qualifiers aggressively",
-      "Avoid clichés completely",
-      "Every sentence must do work (action, tension, character, necessary info, or change)",
-      "Maintain continuity and avoid inventing new facts",
-      "Ensure cause-and-effect is clear at the paragraph level",
-      "Remove decorative metaphor that does not clarify meaning"
-    ];
-
-    const modeRubric: Record<string, string[]> = {
-      humanize: [
-        "Replace generic reactions with character-specific behavior and subtext",
-        "Avoid melodrama; keep emotional shifts motivated by events",
-        "Keep voice consistent and avoid robotic symmetry"
-      ],
-      marketability: [
-        "Tighten openings and transitions; remove throat-clearing",
-        "Sharpen objective, obstacle, and stakes early",
-        "Prioritize readability and tension over ornament"
-      ],
-      tighten: [
-        "Remove redundancy without losing meaning",
-        "Compress neutral description; keep only relevant details",
-        "Prefer one precise image over several weaker ones"
-      ],
-      voice_match: [
-        "Align diction and rhythm to the chosen style constraints",
-        "Apply techniques without copying phrasing",
-        "Keep metaphor budget near zero unless it clarifies"
-      ],
-      clarity: [
-        "Disambiguate pronouns and causal links",
-        "Ground setting and action so the reader can visualize sequence",
-        "Replace abstract nouns with concrete actions"
-      ],
-      dialogue_punchup: [
-        "Dialogue must have leverage and subtext",
-        "Avoid on-the-nose exposition; hide info inside conflict",
-        "Track power shifts per exchange"
-      ],
-      pacing: [
-        "Compress low-tension passages; expand high-tension turns",
-        "End on change: decision, reveal, reversal, escalation",
-        "Make each paragraph move the situation"
-      ]
-    };
-
-    const planCandidate = {
-      schema_version: reqData.schema_version,
-      mode,
-      rubric: [...rubricBase, ...(modeRubric[mode] ?? [])],
-      risks_to_avoid: [
-        "Vague sensory filler",
-        "Unmotivated emotional swings",
-        "Abstract metaphors that do not clarify",
-        "Continuity contradictions",
-        "Cliché phrasing"
-      ],
-      recommended_passes: ["Continuity pass", "Clarity pass", "Pacing pass", "Line-level tightening pass"]
-    };
-
-    const plan = RevisionPlanSchema.parse(planCandidate);
-
-    return upsertArtifact({
-      projectId,
-      type: "revision_plan",
-      name: planName,
-      schemaVersion: plan.schema_version,
-      payload: plan
-    });
-  });
-
-  app.post("/v1/diagnostics/prose", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-
-    const parsed = ProseDiagnosticRequestSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid diagnostic request");
-    const data = parsed.data;
-
-    const analysis = analyzeProse(data.text);
-
-    const issues: Array<{
-      severity: "info" | "warn" | "error";
-      category:
-        | "coherence"
-        | "clarity"
-        | "continuity"
-        | "marketability"
-        | "style_alignment"
-        | "filler"
-        | "rhythm"
-        | "dialogue";
-      message: string;
-    }> = [];
-
-    const m = analysis.metrics;
-
-    if (m.word_count > 0 && m.avg_sentence_words > 30) {
-      issues.push({
-        severity: "warn",
-        category: "rhythm",
-        message: "Sentences run long; tighten and vary cadence"
-      });
-    }
-
-    if (m.filler_phrase_count > 0) {
-      issues.push({
-        severity: "warn",
-        category: "filler",
-        message: "Filler detected; cut throat-clearing and replace generic reactions with specific action"
-      });
-    }
-
-    if (m.vague_word_count > 0) {
-      issues.push({
-        severity: "warn",
-        category: "clarity",
-        message: "Abstract/vague language detected; replace with concrete behavior and specific detail"
-      });
-    }
-
-    const adverbThreshold = Math.max(3, Math.floor(m.word_count / 250));
-    if (m.adverb_like_count > adverbThreshold) {
-      issues.push({
-        severity: "info",
-        category: "clarity",
-        message: "Adverb density may be high; consider stronger verbs and cleaner clauses"
-      });
-    }
-
-    const report = {
-      schema_version: data.schema_version,
-      metrics: analysis.metrics,
-      issues,
-      meta: {
-        directive_name: (data as any).directive_name ?? null,
-        style_profile_name: (data as any).style_profile_name ?? DEFAULT_STYLE_PROFILE_NAME
-      }
-    };
-
-    return upsertArtifact({
-      projectId,
-      type: "quality_report",
-      name: "latest",
-      schemaVersion: report.schema_version,
-      payload: report
-    });
-  });
-
-  // NEW: Deterministic de-AI edit report (and optional safe auto-clean)
-  const DeAiEditsRequestSchema = z.object({
-    schema_version: z.number().int().min(1),
-    text: z.string().min(1).max(200000),
-    apply: z.boolean().optional()
-  });
-
-  app.post("/v1/edits/deai", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
-
-    const parsed = DeAiEditsRequestSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid de-AI edit request");
-    const data = parsed.data;
-
-    const report = generateDeAiReport(data.text);
-
-    let cleaned_text: string | null = null;
-    let applied_ops: DeAiEditOp[] = [];
-
-    if (data.apply === true) {
-      const applied = applySafeDeAiOps(data.text, report.suggested_ops);
-      cleaned_text = applied.text;
-      applied_ops = applied.applied;
-    }
-
-    const response = {
-      schema_version: 1 as const,
-      counts: report.counts,
-      flags: report.flags,
-      applied_ops,
-      cleaned_text
-    };
-
-    // Persist for traceability (separate from prose diagnostics)
-    await upsertArtifact({
-      projectId,
-      type: "quality_report",
-      name: "deai_latest",
-      schemaVersion: 1,
-      payload: response
-    });
-
-    return response;
-  });
-
-  // -------------------------
-  // Optional multi-project routes (keep these)
-  // -------------------------
-
-  app.post("/v1/projects", async (req) => {
-    const parsed = ProjectCreateSchema.safeParse(req.body ?? {});
-    if (!parsed.success) badRequest("Invalid project request");
-    const data = parsed.data;
-
-    const created = await prisma.project.create({
-      data: { name: data.name ?? null }
-    });
-
-    return { project_id: created.id };
-  });
-
-  app.get("/v1/projects", async () => {
-    const projects = await prisma.project.findMany({ orderBy: { updatedAt: "desc" } });
-    return {
-      projects: projects.map((p) => ({
-        project_id: p.id,
-        name: p.name,
-        created_at: p.createdAt,
-        updated_at: p.updatedAt
-      }))
-    };
-  });
-}
+openapi: 3.1.0
+info:
+  title: ProWriter Backend
+  version: 1.0.0
+  description: >
+    ProWriter runs as a Custom GPT with Actions that call this backend.
+    This is NOT the OpenAI API and uses NO OpenAI API keys.
+
+servers:
+  - url: https://prowriter-4jdv.onrender.com
+
+paths:
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /:
+    get:
+      operationId: serviceInfo
+      summary: Service info
+      responses:
+        "200":
+          description: Service info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceInfoResponse"
+
+  /v1/canon-digest:
+    get:
+      operationId: getCanonDigest
+      summary: List available canon artifacts in the default project
+      responses:
+        "200":
+          description: Digest
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CanonDigestResponse"
+
+  /v1/artifacts:
+    get:
+      operationId: listArtifacts
+      summary: List artifacts (default project), optionally filtered by type
+      parameters:
+        - name: type
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/ArtifactType"
+      responses:
+        "200":
+          description: Artifact list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactListResponse"
+
+  /v1/artifacts/{type}/{name}:
+    put:
+      operationId: upsertGenericArtifact
+      summary: Upsert an artifact (default project)
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ArtifactType"
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ArtifactUpsertRequest"
+      responses:
+        "200":
+          description: Upsert result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactRecord"
+
+    get:
+      operationId: getGenericArtifactLatest
+      summary: Get the latest artifact payload (default project)
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ArtifactType"
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        "200":
+          description: Latest artifact
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactRecord"
+
+  /v1/artifacts/{type}/{name}/revisions:
+    get:
+      operationId: listGenericArtifactRevisions
+      summary: List revisions for an artifact (default project)
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ArtifactType"
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        "200":
+          description: Revision list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactRevisionListResponse"
+
+  /v1/artifacts/{type}/{name}/revisions/{revision}:
+    get:
+      operationId: getGenericArtifactRevision
+      summary: Get a specific revision for an artifact (default project)
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ArtifactType"
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: revision
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Artifact revision
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactRevisionRecord"
+
+  /v1/style-profiles/{profileName}:
+    put:
+      operationId: upsertStyleProfile
+      summary: Upsert a style profile (default project)
+      parameters:
+        - name: profileName
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StyleProfile"
+      responses:
+        "200":
+          description: Upsert result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactRecord"
+
+    get:
+      operationId: getStyleProfile
+      summary: Get latest style profile (default project)
+      parameters:
+        - name: profileName
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        "200":
+          description: Latest style profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactRecord"
+
+  /v1/character-sheets/{sheetName}:
+    put:
+      operationId: upsertCharacterSheet
+      summary: Upsert a character sheet (default project)
+      parameters:
+        - name: sheetName
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CharacterSheet"
+      responses:
+        "200":
+          description: Upsert result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactRecord"
+
+    get:
+      operationId: getCharacterSheet
+      summary: Get latest character sheet (default project)
+      parameters:
+        - name: sheetName
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        "200":
+          description: Latest character sheet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactRecord"
+
+  /v1/draft-directives:
+    post:
+      operationId: createDraftDirective
+      summary: Store a draft directive as an artifact (default project)
+      parameters:
+        - name: directiveName
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional name; defaults to "current" on the server
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DraftDirective"
+      responses:
+        "200":
+          description: Stored
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactRecord"
+
+  /v1/revision-plans:
+    post:
+      operationId: createRevisionPlan
+      summary: Generate/store a revision plan (default project)
+      parameters:
+        - name: planName
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional name; defaults to "current" on the server
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevisionPlanRequest"
+      responses:
+        "200":
+          description: Stored
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactRecord"
+
+  /v1/diagnostics/prose:
+    post:
+      operationId: proseDiagnostics
+      summary: Run prose diagnostics and store a quality report (default project)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProseDiagnosticRequest"
+      responses:
+        "200":
+          description: Stored quality report artifact
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactRecord"
+
+  /v1/edits/deai:
+    post:
+      operationId: deAiEdits
+      summary: Detect (and optionally neutralize) common AI-tells from prose (deterministic)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeAiEditsRequest"
+      responses:
+        "200":
+          description: De-AI edit report (and optional cleaned text)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeAiEditsResponse"
+
+  /v1/projects:
+    post:
+      operationId: createProject
+      summary: Create a project (optional; ProWriter does not require this)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectCreateRequest"
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectCreateResponse"
+
+    get:
+      operationId: listProjects
+      summary: List projects (optional)
+      responses:
+        "200":
+          description: Projects
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectListResponse"
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        ok:
+          type: boolean
+      required: [ok]
+
+    ServiceInfoResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        ok: { type: boolean }
+        service: { type: string }
+        endpoints:
+          type: array
+          items: { type: string }
+      required: [ok, service, endpoints]
+
+    ArtifactType:
+      type: string
+      enum:
+        - style_profile
+        - character_sheet
+        - draft_directive
+        - revision_plan
+        - quality_report
+        - freeform_note
+
+    ArtifactSummary:
+      type: object
+      additionalProperties: false
+      properties:
+        type: { $ref: "#/components/schemas/ArtifactType" }
+        name: { type: string }
+        schema_version: { type: integer, minimum: 1 }
+        updated_at: { type: string, format: date-time }
+      required: [type, name, schema_version, updated_at]
+
+    ArtifactListResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        artifacts:
+          type: array
+          items: { $ref: "#/components/schemas/ArtifactSummary" }
+      required: [artifacts]
+
+    ArtifactUpsertRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        schema_version: { type: integer, minimum: 1 }
+        payload:
+          type: object
+          description: JSON payload for this artifact
+          properties:
+            _:
+              type: string
+              description: Placeholder property (payload is otherwise free-form)
+          additionalProperties: true
+      required: [schema_version, payload]
+
+    ArtifactRecord:
+      type: object
+      description: Generic artifact record. Backend may include additional fields.
+      properties:
+        type: { $ref: "#/components/schemas/ArtifactType" }
+        name: { type: string }
+        schema_version: { type: integer, minimum: 1 }
+        revision_number: { type: integer, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        payload:
+          type: object
+          properties: { _: { type: string } }
+          additionalProperties: true
+      required: [type, name, schema_version]
+      additionalProperties: true
+
+    ArtifactRevisionSummary:
+      type: object
+      additionalProperties: false
+      properties:
+        revision_number: { type: integer, minimum: 1 }
+        created_at: { type: string, format: date-time }
+      required: [revision_number, created_at]
+
+    ArtifactRevisionListResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        revisions:
+          type: array
+          items: { $ref: "#/components/schemas/ArtifactRevisionSummary" }
+      required: [revisions]
+
+    ArtifactRevisionRecord:
+      type: object
+      additionalProperties: true
+      properties:
+        type: { $ref: "#/components/schemas/ArtifactType" }
+        name: { type: string }
+        schema_version: { type: integer, minimum: 1 }
+        revision_number: { type: integer, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        payload:
+          type: object
+          properties: { _: { type: string } }
+          additionalProperties: true
+      required: [type, name, schema_version, revision_number, created_at, payload]
+
+    CanonDigestResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        project_id: { type: string }
+        style_profiles:
+          type: array
+          items: { type: string }
+        characters:
+          type: array
+          items: { type: string }
+        draft_directives:
+          type: array
+          items: { type: string }
+      required: [project_id, style_profiles, characters, draft_directives]
+
+    StyleProfile:
+      type: object
+      description: Style rules and constraints for ProWriter.
+      properties:
+        schema_version: { type: integer, minimum: 1 }
+        label: { type: string, minLength: 1 }
+      required: [schema_version, label]
+      additionalProperties: true
+
+    CharacterSheet:
+      type: object
+      description: Character sheet payload.
+      properties:
+        schema_version: { type: integer, minimum: 1 }
+        name: { type: string, minLength: 1 }
+      required: [schema_version, name]
+      additionalProperties: true
+
+    DraftDirectiveBeat:
+      type: object
+      additionalProperties: true
+      properties:
+        purpose: { type: string }
+        event: { type: string }
+
+    DraftDirective:
+      type: object
+      description: Directive that locks objective/conflict/stakes so prose stays purposeful.
+      additionalProperties: true
+      properties:
+        schema_version: { type: integer, minimum: 1 }
+        deliverable:
+          type: string
+          enum: [scene, chapter, cold_open, synopsis, pitch, query_letter, outline]
+        pov: { type: string }
+        tense:
+          type: string
+          enum: [past, present]
+        objective: { type: string }
+        conflict: { type: string }
+        stakes: { type: string }
+        beats:
+          type: array
+          items: { $ref: "#/components/schemas/DraftDirectiveBeat" }
+      required: [schema_version, deliverable, pov, tense, objective, conflict, stakes, beats]
+
+    RevisionPlanRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        schema_version: { type: integer, minimum: 1 }
+        mode:
+          type: string
+          enum: [humanize, marketability, tighten, voice_match, clarity, dialogue_punchup, pacing]
+      required: [schema_version, mode]
+
+    ProseDiagnosticRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        schema_version: { type: integer, minimum: 1 }
+        text: { type: string, minLength: 1, maxLength: 200000 }
+        directive_name: { type: string }
+        style_profile_name: { type: string }
+      required: [schema_version, text]
+
+    DeAiEditsRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        schema_version: { type: integer, minimum: 1 }
+        text: { type: string, minLength: 1, maxLength: 200000 }
+        apply:
+          type: boolean
+          description: If true, applies conservative automatic deletions/replacements.
+      required: [schema_version, text]
+
+    DeAiTextSpan:
+      type: object
+      additionalProperties: false
+      properties:
+        start: { type: integer, minimum: 0 }
+        end: { type: integer, minimum: 0 }
+        snippet: { type: string }
+      required: [start, end, snippet]
+
+    DeAiFlag:
+      type: object
+      additionalProperties: false
+      properties:
+        kind: { type: string }
+        severity:
+          type: string
+          enum: [info, warn, error]
+        message: { type: string }
+        spans:
+          type: array
+          items: { $ref: "#/components/schemas/DeAiTextSpan" }
+      required: [kind, severity, message, spans]
+
+    DeAiEditsResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        schema_version: { type: integer }
+        counts:
+          type: object
+          additionalProperties: { type: integer }
+        flags:
+          type: array
+          items: { $ref: "#/components/schemas/DeAiFlag" }
+        applied_ops:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        cleaned_text:
+          anyOf:
+            - type: string
+            - type: "null"
+      required: [schema_version, counts, flags, applied_ops, cleaned_text]
+
+    ProjectCreateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1 }
+      required: [name]
+
+    ProjectCreateResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        project_id: { type: string }
+      required: [project_id]
+
+    ProjectListItem:
+      type: object
+      additionalProperties: false
+      properties:
+        project_id: { type: string }
+        name:
+          anyOf:
+            - type: string
+            - type: "null"
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      required: [project_id, name, created_at, updated_at]
+
+    ProjectListResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        projects:
+          type: array
+          items: { $ref: "#/components/schemas/ProjectListItem" }
+      required: [projects]
