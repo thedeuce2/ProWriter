@@ -31,8 +31,6 @@ const DEFAULT_STYLE_PROFILE_NAME = "prowriter_default";
 /**
  * Default operating style for ProWriter.
  * Seeded once into the DB so the GPT can reference it consistently.
- *
- * Goal: grounded, clear, concise, active, no cliché, no abstract metaphor fog.
  */
 const DEFAULT_STYLE_PROFILE = {
   schema_version: 1,
@@ -64,7 +62,8 @@ const DEFAULT_STYLE_PROFILE = {
       "symmetrical AI cadence and over-balanced sentences",
       "decorative metaphor",
       "cosmic/generalized abstraction (universe, abyss, eternity, void, darkness-as-mood)",
-      "dreamlike/fog/shattered/whispered-into-the-night phrasing"
+      "dreamlike/fog/shattered/whispered-into-the-night phrasing",
+      "moralizing punchlines that do not translate into literal consequence"
     ],
     must_include: [
       "show-dont-tell via behavior + concrete detail + consequence",
@@ -72,19 +71,23 @@ const DEFAULT_STYLE_PROFILE = {
       "every sentence does work (action, tension, character, necessary info, or change)",
       "cause-and-effect clarity",
       "only relevant detail (no neutral description)"
-    ],
-    rating_boundaries:
-      "Follow user boundaries. Default: grounded adult themes allowed; avoid explicit sexual content unless the user explicitly requests it."
+    ]
   }
 } as const;
 
 /* -----------------------------
    Deterministic "De-AI" Edit Helpers
-   (No LLM calls. Heuristic detection + safe deletions only.)
+   (No LLM calls. Heuristic detection + conservative auto-fixes.)
 ------------------------------ */
 
 type DeAiSeverity = "info" | "warn" | "error";
-type DeAiFlagKind = "personification" | "vague_language" | "abstract_simile" | "cliche" | "rhetorical_frame" | "filler";
+type DeAiFlagKind =
+  | "personification"
+  | "vague_language"
+  | "abstract_simile"
+  | "cliche"
+  | "rhetorical_frame"
+  | "filler";
 
 type TextSpan = {
   start: number;
@@ -106,7 +109,32 @@ type DeAiEditOp = {
   note: string;
 };
 
-const PERSONIFICATION_VERBS = ["begged", "whispered", "groaned", "sighed", "gasped", "moaned", "pleaded", "sang"];
+const PERSONIFICATION_VERBS = [
+  // intent / speech / breath
+  "begged",
+  "pleaded",
+  "whispered",
+  "muttered",
+  "groaned",
+  "sighed",
+  "gasped",
+  "moaned",
+  "laughed",
+  "sang",
+  // “object behaving like a creature”
+  "clung",
+  "gripped",
+  "held",
+  "grabbed",
+  "swallowed",
+  "breathed",
+  "breathing",
+  "pressed",
+  "hung"
+];
+
+const ANTHRO_SOUND_NOUNS = ["gasp", "groan", "sigh", "whisper", "mutter", "moan"];
+const ANTHRO_SOUND_ADJ = ["wet", "low", "thin", "sharp", "raw", "soft", "faint", "quiet"];
 
 const VAGUE_WORDS = [
   "somehow",
@@ -120,7 +148,6 @@ const VAGUE_WORDS = [
   "stuff",
   "wrong",
   "strange",
-  "dark",
   "beautiful"
 ];
 
@@ -134,6 +161,9 @@ const BANNED_PHRASES = [
 ];
 
 const ABSTRACT_SIMILE_TARGETS = ["sin", "evil", "darkness", "the abyss", "death", "fate", "destiny"];
+
+// moralizing “tagline” endings that read AI-ish
+const MORALIZING_TAGLINES = ["damn you", "save you", "ruin you", "haunt you"];
 
 function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -193,9 +223,23 @@ function generateDeAiReport(text: string): {
   const flags: DeAiFlag[] = [];
   const suggested_ops: DeAiEditOp[] = [];
 
-  // Personification: "the mud begged", "a creek groaned", etc.
+  // 1) rhetorical flourish: “didn’t just X — it Y”
+  const flourishRe = /\b(?:didn’t|didn't)\s+just\b[^—\n]{0,120}—\s*it\b/gi;
+  const flourishSpans = spansForRegex(text, flourishRe);
+  if (flourishSpans.length > 0) {
+    flags.push({
+      kind: "rhetorical_frame",
+      severity: "warn",
+      message: 'Rhetorical flourish detected ("didn’t just…—it…"). Convert to literal, direct statements.',
+      spans: flourishSpans
+    });
+  }
+
+  // 2) personification: “the/a/an <noun> <human-ish verb>”
   const personificationRe = new RegExp(
-    String.raw`\b(?:the|a|an)\s+[a-z][\w-]*\s+(?:${PERSONIFICATION_VERBS.map(escapeRe).join("|")})\b`,
+    String.raw`\b(?:the|a|an)\s+[a-z][\w-]*(?:\s+[a-z][\w-]*){0,2}\s+(?:${PERSONIFICATION_VERBS
+      .map(escapeRe)
+      .join("|")})\b`,
     "gi"
   );
   const personSpans = spansForRegex(text, personificationRe);
@@ -204,12 +248,71 @@ function generateDeAiReport(text: string): {
       kind: "personification",
       severity: "warn",
       message:
-        "Personification detected. Replace with literal physical behavior (what actually happens) rather than giving objects human intent.",
+        "Personification detected. Replace with literal physical behavior rather than giving objects human intent or speech.",
       spans: personSpans
     });
   }
 
-  // Vague words
+  // 3) anthropomorphic sound nouns (“wet gasp”, “a whisper”, etc.)
+  const soundNounRe = new RegExp(
+    String.raw`\b(?:${ANTHRO_SOUND_ADJ.map(escapeRe).join("|")})\s+(?:${ANTHRO_SOUND_NOUNS
+      .map(escapeRe)
+      .join("|")})\b|\b(?:a|an)\s+(?:${ANTHRO_SOUND_NOUNS.map(escapeRe).join("|")})\b`,
+    "gi"
+  );
+  const soundSpans = spansForRegex(text, soundNounRe);
+  if (soundSpans.length > 0) {
+    flags.push({
+      kind: "personification",
+      severity: "warn",
+      message:
+        'Anthropomorphic sound noun detected (e.g., "gasp", "whisper"). Replace with neutral sound terms unless the subject is a person.',
+      spans: soundSpans
+    });
+
+    // conservative replacements
+    for (const sp of soundSpans.slice(0, 25)) {
+      const lower = sp.snippet.toLowerCase();
+      if (lower.includes("whisper")) {
+        suggested_ops.push({
+          op: "replace",
+          span: sp,
+          replacement: sp.snippet.replace(/whisper/gi, "trace"),
+          note: 'Replace anthropomorphic noun "whisper" with "trace"'
+        });
+      } else {
+        suggested_ops.push({
+          op: "replace",
+          span: sp,
+          replacement: sp.snippet.replace(/gasp|groan|sigh|mutter|moan/gi, "sound"),
+          note: "Replace anthropomorphic sound noun with neutral 'sound'"
+        });
+      }
+    }
+  }
+
+  // 4) “whisper of …” construction
+  const whisperOfSpans = phraseSpans(text, "whisper of");
+  if (whisperOfSpans.length > 0) {
+    flags.push({
+      kind: "personification",
+      severity: "warn",
+      message:
+        'Phrase "whisper of" detected. Prefer concrete quantity words (trace, hint, smear) tied to a physical source.',
+      spans: whisperOfSpans
+    });
+
+    for (const sp of whisperOfSpans.slice(0, 20)) {
+      suggested_ops.push({
+        op: "replace",
+        span: sp,
+        replacement: sp.snippet.replace(/whisper of/gi, "trace of"),
+        note: 'Replace "whisper of" with "trace of"'
+      });
+    }
+  }
+
+  // 5) vague words
   const vagueSpans: TextSpan[] = [];
   for (const w of VAGUE_WORDS) {
     const re = new RegExp(String.raw`\b${escapeRe(w)}\b`, "gi");
@@ -224,7 +327,7 @@ function generateDeAiReport(text: string): {
     });
   }
 
-  // Abstract similes: "like sin", "like fate", etc.
+  // 6) abstract similes: “like sin/fate/…”
   const abstractSimileRe = new RegExp(
     String.raw`\blike\s+(?:${ABSTRACT_SIMILE_TARGETS.map(escapeRe).join("|")})\b`,
     "gi"
@@ -240,7 +343,23 @@ function generateDeAiReport(text: string): {
     });
   }
 
-  // Hard-banned cliché phrases
+  // 7) moralizing taglines: “enough to damn you”
+  const moralizingRe = new RegExp(
+    String.raw`\benough\s+to\s+(?:${MORALIZING_TAGLINES.map(escapeRe).join("|")})\b`,
+    "gi"
+  );
+  const moralSpans = spansForRegex(text, moralizingRe);
+  if (moralSpans.length > 0) {
+    flags.push({
+      kind: "abstract_simile",
+      severity: "warn",
+      message:
+        'Moralizing tagline detected (e.g., "enough to damn you"). Replace with literal consequence (what it does to the body, the plan, or the risk).',
+      spans: moralSpans
+    });
+  }
+
+  // 8) hard-banned cliché phrases
   const clicheSpans: TextSpan[] = [];
   for (const p of BANNED_PHRASES) clicheSpans.push(...phraseSpans(text, p));
   if (clicheSpans.length > 0) {
@@ -255,19 +374,7 @@ function generateDeAiReport(text: string): {
     }
   }
 
-  // Rhetorical filter phrases: "you could taste it:", etc.
-  const rhetoricalRe = /\byou could (?:taste|feel|hear|see)\s+it\b\s*:?/gi;
-  const rhetSpans = spansForRegex(text, rhetoricalRe);
-  if (rhetSpans.length > 0) {
-    flags.push({
-      kind: "rhetorical_frame",
-      severity: "info",
-      message: 'Rhetorical filter phrase detected ("you could ..."). Prefer direct sensory statements without the filter.',
-      spans: rhetSpans
-    });
-  }
-
-  // Filler words (safe deletions)
+  // 9) simple filler words (safe deletions)
   const fillerTargets = ["very", "really", "just", "somehow"];
   const fillerSpans: TextSpan[] = [];
   for (const w of fillerTargets) {
@@ -286,33 +393,41 @@ function generateDeAiReport(text: string): {
     }
   }
 
-  return {
-    schema_version: 1,
-    counts: {
-      personification: personSpans.length,
-      vague_language: vagueSpans.length,
-      abstract_simile: absSpans.length,
-      cliche: clicheSpans.length,
-      rhetorical_frame: rhetSpans.length,
-      filler: fillerSpans.length
-    },
-    flags,
-    suggested_ops
+  const counts: Record<string, number> = {
+    personification: personSpans.length + soundSpans.length + whisperOfSpans.length,
+    vague_language: vagueSpans.length,
+    abstract_simile: absSpans.length + moralSpans.length,
+    cliche: clicheSpans.length,
+    rhetorical_frame: flourishSpans.length,
+    filler: fillerSpans.length
   };
+
+  return { schema_version: 1, counts, flags, suggested_ops };
 }
 
 function applySafeDeAiOps(text: string, ops: DeAiEditOp[]): { text: string; applied: DeAiEditOp[] } {
-  // Only apply deletes (no replacements) to avoid changing meaning unpredictably.
-  const deletes = ops.filter((o) => o.op === "delete").slice(0, 80);
-
-  // Apply from end to start so indices stay valid.
-  const sorted = deletes.slice().sort((a, b) => b.span.start - a.span.start);
+  // Conservative: apply deletes + only the limited “safe” replacements we generated.
+  const safe = ops.slice(0, 120);
+  const sorted = safe.slice().sort((a, b) => b.span.start - a.span.start);
 
   let out = text;
+  const applied: DeAiEditOp[] = [];
+
   for (const op of sorted) {
-    out = out.slice(0, op.span.start) + out.slice(op.span.end);
+    if (op.op === "delete") {
+      out = out.slice(0, op.span.start) + out.slice(op.span.end);
+      applied.push(op);
+      continue;
+    }
+
+    if (op.op === "replace" && typeof op.replacement === "string") {
+      out = out.slice(0, op.span.start) + op.replacement + out.slice(op.span.end);
+      applied.push(op);
+      continue;
+    }
   }
-  return { text: out, applied: deletes };
+
+  return { text: out, applied };
 }
 
 /* -----------------------------
@@ -422,7 +537,6 @@ export async function registerRoutes(app: FastifyInstance) {
   app.get("/v1/artifacts", async (req) => {
     const projectId = await getOrCreateDefaultProjectId();
     const q = req.query as { type?: string };
-
     const type = q.type ? asArtifactType(q.type) : undefined;
     return { artifacts: await listArtifacts(projectId, type) };
   });
@@ -631,7 +745,8 @@ export async function registerRoutes(app: FastifyInstance) {
         "Unmotivated emotional swings",
         "Abstract metaphors that do not clarify",
         "Continuity contradictions",
-        "Cliché phrasing"
+        "Cliché phrasing",
+        "Moralizing punchlines"
       ],
       recommended_passes: ["Continuity pass", "Clarity pass", "Pacing pass", "Line-level tightening pass"]
     };
@@ -673,11 +788,7 @@ export async function registerRoutes(app: FastifyInstance) {
     const m = analysis.metrics;
 
     if (m.word_count > 0 && m.avg_sentence_words > 30) {
-      issues.push({
-        severity: "warn",
-        category: "rhythm",
-        message: "Sentences run long; tighten and vary cadence"
-      });
+      issues.push({ severity: "warn", category: "rhythm", message: "Sentences run long; tighten and vary cadence" });
     }
 
     if (m.filler_phrase_count > 0) {
@@ -724,7 +835,7 @@ export async function registerRoutes(app: FastifyInstance) {
     });
   });
 
-  // NEW: Deterministic de-AI edit report (and optional safe auto-clean)
+  // Deterministic de-AI edit report (and optional conservative auto-clean)
   const DeAiEditsRequestSchema = z.object({
     schema_version: z.number().int().min(1),
     text: z.string().min(1).max(200000),
@@ -757,7 +868,6 @@ export async function registerRoutes(app: FastifyInstance) {
       cleaned_text
     };
 
-    // Persist for traceability (separate from prose diagnostics)
     await upsertArtifact({
       projectId,
       type: "quality_report",
