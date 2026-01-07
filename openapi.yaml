@@ -429,7 +429,7 @@ components:
         schema_version: { type: integer, minimum: 1 }
         payload:
           type: object
-          description: JSON payload for this artifact
+          description: JSON payload for this artifact (free-form but must satisfy server validation by type)
           properties:
             _:
               type: string
@@ -445,11 +445,12 @@ components:
         name: { type: string }
         schema_version: { type: integer, minimum: 1 }
         revision_number: { type: integer, minimum: 1 }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
         payload:
           type: object
-          properties: { _: { type: string } }
+          properties:
+            _:
+              type: string
+              description: Placeholder property
           additionalProperties: true
       required: [type, name, schema_version]
       additionalProperties: true
@@ -482,7 +483,10 @@ components:
         created_at: { type: string, format: date-time }
         payload:
           type: object
-          properties: { _: { type: string } }
+          properties:
+            _:
+              type: string
+              description: Placeholder property
           additionalProperties: true
       required: [type, name, schema_version, revision_number, created_at, payload]
 
@@ -576,7 +580,7 @@ components:
         text: { type: string, minLength: 1, maxLength: 200000 }
         apply:
           type: boolean
-          description: If true, applies conservative automatic deletions/replacements.
+          description: If true, applies conservative automatic deletions.
       required: [schema_version, text]
 
     DeAiTextSpan:
@@ -609,6 +613,10 @@ components:
         schema_version: { type: integer }
         counts:
           type: object
+          properties:
+            _:
+              type: integer
+              description: Placeholder property
           additionalProperties: { type: integer }
         flags:
           type: array
@@ -617,6 +625,10 @@ components:
           type: array
           items:
             type: object
+            properties:
+              _:
+                type: string
+                description: Placeholder property
             additionalProperties: true
         cleaned_text:
           anyOf:
@@ -629,7 +641,7 @@ components:
       additionalProperties: false
       properties:
         name: { type: string, minLength: 1 }
-      required: [name]
+      required: []
 
     ProjectCreateResponse:
       type: object
