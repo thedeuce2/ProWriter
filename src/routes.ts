@@ -33,8 +33,8 @@ const DEFAULT_PROJECT_NAME = "default";
 const DEFAULT_STYLE_PROFILE_NAME = "prowriter_default";
 
 /**
- * Keep this minimal and rules-based (not “example prose”).
- * This exists so the GPT always has a baseline style profile to reference.
+ * Rules-based default profile (no example prose).
+ * Seeded once so the GPT can reference a stable baseline.
  */
 const DEFAULT_STYLE_PROFILE = {
   schema_version: 1,
@@ -84,10 +84,38 @@ const DEFAULT_STYLE_PROFILE = {
 ------------------------------ */
 
 function badRequest(message: string): never {
-  const err = new Error(message);
-  // @ts-expect-error fastify reads statusCode
+  const err: any = new Error(message);
   err.statusCode = 400;
   throw err;
+}
+
+function readJsonBody(body: unknown): unknown {
+  // Fastify usually gives an object, but some setups can hand you a string/buffer.
+  if (typeof body === "string") {
+    try {
+      return JSON.parse(body);
+    } catch {
+      return body;
+    }
+  }
+  // Buffer or Uint8Array
+  if (body && typeof body === "object" && "byteLength" in (body as any) && "slice" in (body as any)) {
+    try {
+      const buf = Buffer.from(body as any);
+      return JSON.parse(buf.toString("utf8"));
+    } catch {
+      return body;
+    }
+  }
+  return body;
+}
+
+function parseBody<T>(schema: z.ZodType<T>, body: unknown, message: string): T {
+  try {
+    return schema.parse(readJsonBody(body));
+  } catch {
+    badRequest(message);
+  }
 }
 
 function asArtifactType(s: string): ArtifactType {
@@ -156,18 +184,12 @@ async function getOrCreateDefaultProjectId(): Promise<string> {
 ------------------------------ */
 
 type DeAiSeverity = "info" | "warn" | "error";
-type DeAiFlagKind =
-  | "personification"
-  | "vague_language"
-  | "abstract_simile"
-  | "cliche"
-  | "rhetorical_frame"
-  | "filler";
+type DeAiFlagKind = "rhetorical_frame" | "personification" | "vague_language" | "cliche" | "filler";
 
 type TextSpan = { start: number; end: number; snippet: string };
 
 type DeAiFlag = {
-  kind: DeAiFlagKind;
+  kind: DeAiFlagKind | "internal_error";
   severity: DeAiSeverity;
   message: string;
   spans: TextSpan[];
@@ -210,20 +232,7 @@ const PERSONIFICATION_VERBS = [
   "hung"
 ];
 
-const VAGUE_WORDS = [
-  "somehow",
-  "suddenly",
-  "really",
-  "very",
-  "just",
-  "kind of",
-  "sort of",
-  "thing",
-  "stuff",
-  "wrong",
-  "strange",
-  "beautiful"
-];
+const VAGUE_WORDS = ["somehow", "suddenly", "really", "very", "just", "kind of", "sort of", "thing", "stuff"];
 
 const BANNED_PHRASES = [
   "like a dream",
@@ -300,7 +309,7 @@ function generateDeAiReport(text: string): {
     flags.push({
       kind: "rhetorical_frame",
       severity: "warn",
-      message: 'Rhetorical flourish detected ("didn’t just…—it…"). Consider rewriting as literal statements.',
+      message: 'Rhetorical frame detected ("didn’t just…—it…"). Prefer literal statements.',
       spans: flourishSpans
     });
   }
@@ -349,7 +358,7 @@ function generateDeAiReport(text: string): {
     });
   }
 
-  // banned phrases / clichés
+  // clichés
   const clicheSpans: TextSpan[] = [];
   for (const p of BANNED_PHRASES) clicheSpans.push(...phraseSpans(text, p));
   if (clicheSpans.length > 0) {
@@ -364,6 +373,7 @@ function generateDeAiReport(text: string): {
     }
   }
 
+  // filler
   const fillerTargets = ["very", "really", "just", "somehow"];
   const fillerSpans: TextSpan[] = [];
   for (const w of fillerTargets) {
@@ -421,11 +431,19 @@ function applySafeDeAiOps(text: string, ops: DeAiEditOp[]): { text: string; appl
 ------------------------------ */
 
 export async function registerRoutes(app: FastifyInstance) {
-  // deterministic errors (small payloads)
+  // deterministic errors + include message for 400s so you can debug without spelunking logs
   app.setErrorHandler((error, _req, reply) => {
     const status = (error as any).statusCode ?? 500;
+
+    if (status >= 500) {
+      console.error("INTERNAL ERROR:", error);
+      reply.code(status).send({ error: "internal_error" });
+      return;
+    }
+
     reply.code(status).send({
-      error: status === 500 ? "internal_error" : "bad_request"
+      error: "bad_request",
+      message: (error as any)?.message ?? "bad_request"
     });
   });
 
@@ -484,11 +502,7 @@ export async function registerRoutes(app: FastifyInstance) {
     const { type, name } = req.params as { type: string; name: string };
 
     const artifactType = asArtifactType(type);
-
-    const parsedBody = ArtifactUpsertSchema.safeParse(req.body);
-    if (!parsedBody.success) badRequest("Invalid artifact upsert body");
-
-    const body = parsedBody.data;
+    const body = parseBody(ArtifactUpsertSchema, req.body, "Invalid artifact upsert body");
 
     await upsertArtifact({
       projectId,
@@ -519,12 +533,14 @@ export async function registerRoutes(app: FastifyInstance) {
     const { type, name } = req.params as { type: string; name: string };
 
     const artifactType = asArtifactType(type);
-
     const list = await listArtifactRevisions({ projectId, type: artifactType, name });
     if (!list) return { error: "not_found" };
 
     return {
-      revisions: list.map((r) => ({ revision_number: r.revision, created_at: r.created_at }))
+      revisions: list.map((r) => ({
+        revision_number: r.revision,
+        created_at: r.created_at
+      }))
     };
   });
 
@@ -546,12 +562,13 @@ export async function registerRoutes(app: FastifyInstance) {
 
     if (!item) return { error: "not_found" };
 
+    // If artifacts.ts doesn’t provide created_at, we still return a valid shape.
     return {
       type: item.type,
       name: item.name,
       schema_version: item.schema_version,
       revision_number: item.revision,
-      created_at: new Date().toISOString(),
+      created_at: (item as any).created_at ?? new Date().toISOString(),
       payload: item.payload
     };
   });
@@ -560,15 +577,14 @@ export async function registerRoutes(app: FastifyInstance) {
     const projectId = await getOrCreateDefaultProjectId();
     const { profileName } = req.params as { profileName: string };
 
-    const parsed = StyleProfileSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid style profile");
+    const data = parseBody(StyleProfileSchema, req.body, "Invalid style profile");
 
     await upsertArtifact({
       projectId,
       type: "style_profile",
       name: profileName,
-      schemaVersion: parsed.data.schema_version,
-      payload: parsed.data
+      schemaVersion: data.schema_version,
+      payload: data
     });
 
     const latest = await getArtifactLatest({ projectId, type: "style_profile", name: profileName });
@@ -589,15 +605,14 @@ export async function registerRoutes(app: FastifyInstance) {
     const projectId = await getOrCreateDefaultProjectId();
     const { sheetName } = req.params as { sheetName: string };
 
-    const parsed = CharacterSheetSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid character sheet");
+    const data = parseBody(CharacterSheetSchema, req.body, "Invalid character sheet");
 
     await upsertArtifact({
       projectId,
       type: "character_sheet",
       name: sheetName,
-      schemaVersion: parsed.data.schema_version,
-      payload: parsed.data
+      schemaVersion: data.schema_version,
+      payload: data
     });
 
     const latest = await getArtifactLatest({ projectId, type: "character_sheet", name: sheetName });
@@ -617,18 +632,16 @@ export async function registerRoutes(app: FastifyInstance) {
   app.post("/v1/draft-directives", async (req) => {
     const projectId = await getOrCreateDefaultProjectId();
     const q = req.query as { directiveName?: string };
-
     const directiveName = nonEmptyQueryString(q.directiveName, "current");
 
-    const parsed = DraftDirectiveSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid draft directive");
+    const data = parseBody(DraftDirectiveSchema, req.body, "Invalid draft directive");
 
     await upsertArtifact({
       projectId,
       type: "draft_directive",
       name: directiveName,
-      schemaVersion: parsed.data.schema_version,
-      payload: parsed.data
+      schemaVersion: data.schema_version,
+      payload: data
     });
 
     const latest = await getArtifactLatest({ projectId, type: "draft_directive", name: directiveName });
@@ -639,13 +652,10 @@ export async function registerRoutes(app: FastifyInstance) {
   app.post("/v1/revision-plans", async (req) => {
     const projectId = await getOrCreateDefaultProjectId();
     const q = req.query as { planName?: string };
-
     const planName = nonEmptyQueryString(q.planName, "current");
 
-    const parsed = RevisionPlanRequestSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid revision plan request");
-
-    const mode = parsed.data.mode;
+    const reqData = parseBody(RevisionPlanRequestSchema, req.body, "Invalid revision plan request");
+    const mode = reqData.mode;
 
     const rubricBase: string[] = [
       "Clarity beats beauty; rewrite anything that is pretty but unclear",
@@ -699,7 +709,7 @@ export async function registerRoutes(app: FastifyInstance) {
     };
 
     const planCandidate = {
-      schema_version: parsed.data.schema_version,
+      schema_version: reqData.schema_version,
       mode,
       rubric: [...rubricBase, ...(modeRubric[mode] ?? [])],
       risks_to_avoid: [
@@ -730,12 +740,10 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.post("/v1/diagnostics/prose", async (req) => {
     const projectId = await getOrCreateDefaultProjectId();
+    const data = parseBody(ProseDiagnosticRequestSchema, req.body, "Invalid diagnostic request");
 
-    const parsed = ProseDiagnosticRequestSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid diagnostic request");
-
-    const data = parsed.data;
     const analysis = analyzeProse(data.text);
+    const m = analysis.metrics;
 
     const issues: Array<{
       severity: "info" | "warn" | "error";
@@ -751,12 +759,9 @@ export async function registerRoutes(app: FastifyInstance) {
       message: string;
     }> = [];
 
-    const m = analysis.metrics;
-
     if (m.word_count > 0 && m.avg_sentence_words > 30) {
       issues.push({ severity: "warn", category: "rhythm", message: "Sentences run long; tighten and vary cadence" });
     }
-
     if (m.filler_phrase_count > 0) {
       issues.push({
         severity: "warn",
@@ -764,7 +769,6 @@ export async function registerRoutes(app: FastifyInstance) {
         message: "Filler detected; cut throat-clearing and replace generic phrasing with specific action"
       });
     }
-
     if (m.vague_word_count > 0) {
       issues.push({
         severity: "warn",
@@ -805,42 +809,71 @@ export async function registerRoutes(app: FastifyInstance) {
     return toArtifactRecord(latest);
   });
 
-  app.post("/v1/edits/deai", async (req) => {
-    const projectId = await getOrCreateDefaultProjectId();
+  // IMPORTANT: this endpoint will NOT 500 just because persistence fails.
+  app.post("/v1/edits/deai", async (req, reply) => {
+    const data = parseBody(DeAiEditsRequestSchema, req.body, "Invalid de-AI edit request");
 
-    const parsed = DeAiEditsRequestSchema.safeParse(req.body);
-    if (!parsed.success) badRequest("Invalid de-AI edit request");
-
-    const data = parsed.data;
-
-    const report = generateDeAiReport(data.text);
-
-    let cleaned_text: string | null = null;
-    let applied_ops: DeAiEditOp[] = [];
-
-    if (data.apply === true) {
-      const applied = applySafeDeAiOps(data.text, report.suggested_ops);
-      cleaned_text = applied.text;
-      applied_ops = applied.applied;
-    }
-
-    const response = {
-      schema_version: 1,
-      counts: report.counts,
-      flags: report.flags,
-      applied_ops,
-      cleaned_text
+    let response: {
+      schema_version: number;
+      counts: Record<string, number>;
+      flags: DeAiFlag[];
+      applied_ops: DeAiEditOp[];
+      cleaned_text: string | null;
     };
 
-    await upsertArtifact({
-      projectId,
-      type: "quality_report",
-      name: "deai_latest",
-      schemaVersion: 1,
-      payload: response
-    });
+    try {
+      const report = generateDeAiReport(data.text);
 
-    return response;
+      let cleaned_text: string | null = null;
+      let applied_ops: DeAiEditOp[] = [];
+
+      if (data.apply === true) {
+        const applied = applySafeDeAiOps(data.text, report.suggested_ops);
+        cleaned_text = applied.text;
+        applied_ops = applied.applied;
+      }
+
+      response = {
+        schema_version: 1,
+        counts: report.counts,
+        flags: report.flags,
+        applied_ops,
+        cleaned_text
+      };
+    } catch (e) {
+      console.error("deAiEdits compute failed:", e);
+      response = {
+        schema_version: 1,
+        counts: {},
+        flags: [
+          {
+            kind: "internal_error",
+            severity: "error",
+            message: "deAiEdits failed during analysis; fall back to prose diagnostics.",
+            spans: []
+          }
+        ],
+        applied_ops: [],
+        cleaned_text: null
+      };
+    }
+
+    // best-effort store (should not break the endpoint)
+    try {
+      const projectId = await getOrCreateDefaultProjectId();
+      await upsertArtifact({
+        projectId,
+        type: "quality_report",
+        name: "deai_latest",
+        schemaVersion: 1,
+        payload: response
+      });
+    } catch (e) {
+      console.error("deAiEdits save failed:", e);
+    }
+
+    reply.code(200).send(response);
+    return;
   });
 
   /* -------------------------
@@ -848,11 +881,10 @@ export async function registerRoutes(app: FastifyInstance) {
   -------------------------- */
 
   app.post("/v1/projects", async (req) => {
-    const parsed = ProjectCreateSchema.safeParse(req.body ?? {});
-    if (!parsed.success) badRequest("Invalid project request");
+    const data = parseBody(ProjectCreateSchema, req.body ?? {}, "Invalid project request");
 
     const created = await prisma.project.create({
-      data: { name: parsed.data.name ?? null }
+      data: { name: (data as any).name ?? null }
     });
 
     return { project_id: created.id };
