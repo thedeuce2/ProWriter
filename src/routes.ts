@@ -6,15 +6,15 @@ import { z } from "zod";
 import { prisma } from "./prisma.js";
 import { analyzeProse } from "./prose_diagnostics.js";
 import {
+  ArtifactTypeSchema,
+  ArtifactUpsertSchema,
+  CharacterSheetSchema,
+  DraftDirectiveSchema,
   ProjectCreateSchema,
   ProseDiagnosticRequestSchema,
   RevisionPlanRequestSchema,
   RevisionPlanSchema,
-  DraftDirectiveSchema,
-  StyleProfileSchema,
-  CharacterSheetSchema,
-  ArtifactTypeSchema,
-  ArtifactUpsertSchema
+  StyleProfileSchema
 } from "./validation.js";
 import type { ArtifactType } from "./types.js";
 import {
@@ -25,12 +25,16 @@ import {
   getArtifactRevision
 } from "./artifacts.js";
 
+/* -----------------------------
+   Defaults (single-project mode)
+------------------------------ */
+
 const DEFAULT_PROJECT_NAME = "default";
 const DEFAULT_STYLE_PROFILE_NAME = "prowriter_default";
 
 /**
- * Default operating style for ProWriter.
- * Seeded once into the DB so the GPT can reference it consistently.
+ * Keep this minimal and rules-based (not “example prose”).
+ * This exists so the GPT always has a baseline style profile to reference.
  */
 const DEFAULT_STYLE_PROFILE = {
   schema_version: 1,
@@ -76,377 +80,7 @@ const DEFAULT_STYLE_PROFILE = {
 } as const;
 
 /* -----------------------------
-   Deterministic "De-AI" Edit Helpers
-   (No LLM calls. Heuristic detection + conservative auto-fixes.)
------------------------------- */
-
-type DeAiSeverity = "info" | "warn" | "error";
-type DeAiFlagKind =
-  | "personification"
-  | "vague_language"
-  | "abstract_simile"
-  | "cliche"
-  | "rhetorical_frame"
-  | "filler";
-
-type TextSpan = {
-  start: number;
-  end: number;
-  snippet: string;
-};
-
-type DeAiFlag = {
-  kind: DeAiFlagKind;
-  severity: DeAiSeverity;
-  message: string;
-  spans: TextSpan[];
-};
-
-type DeAiEditOp = {
-  op: "delete" | "replace";
-  span: TextSpan;
-  replacement: string | null;
-  note: string;
-};
-
-const PERSONIFICATION_VERBS = [
-  // intent / speech / breath
-  "begged",
-  "pleaded",
-  "whispered",
-  "muttered",
-  "groaned",
-  "sighed",
-  "gasped",
-  "moaned",
-  "laughed",
-  "sang",
-  // “object behaving like a creature”
-  "clung",
-  "gripped",
-  "held",
-  "grabbed",
-  "swallowed",
-  "claimed",
-  "answered",
-  "breathed",
-  "breathing",
-  "pressed",
-  "hung"
-];
-
-const ANTHRO_SOUND_NOUNS = ["gasp", "groan", "sigh", "whisper", "mutter", "moan"];
-const ANTHRO_SOUND_ADJ = ["wet", "low", "thin", "sharp", "raw", "soft", "faint", "quiet"];
-
-const VAGUE_WORDS = [
-  "somehow",
-  "suddenly",
-  "really",
-  "very",
-  "just",
-  "kind of",
-  "sort of",
-  "thing",
-  "stuff",
-  "wrong",
-  "strange",
-  "beautiful"
-];
-
-const BANNED_PHRASES = [
-  "like a dream",
-  "like a nightmare",
-  "time stood still",
-  "in the blink of an eye",
-  "cold as ice",
-  "silence was deafening",
-  "rotten at the core"
-];
-
-const ABSTRACT_SIMILE_TARGETS = ["sin", "evil", "darkness", "the abyss", "death", "fate", "destiny"];
-
-// moralizing “tagline” endings that read AI-ish
-const MORALIZING_TAGLINES = ["damn you", "save you", "ruin you", "haunt you"];
-
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function clampSnippet(text: string, start: number, end: number): string {
-  const s = Math.max(0, start);
-  const e = Math.min(text.length, end);
-  return text.slice(s, e);
-}
-
-function spansForRegex(text: string, re: RegExp, maxMatches = 60): TextSpan[] {
-  const spans: TextSpan[] = [];
-  const global = re.global ? re : new RegExp(re.source, re.flags + "g");
-  let count = 0;
-
-  for (const m of text.matchAll(global)) {
-    const idx = m.index;
-    if (idx === undefined) continue;
-    const start = idx;
-    const end = start + m[0].length;
-    spans.push({ start, end, snippet: clampSnippet(text, start, end) });
-    count += 1;
-    if (count >= maxMatches) break;
-  }
-
-  return spans;
-}
-
-function phraseSpans(text: string, phrase: string, maxMatches = 40): TextSpan[] {
-  const spans: TextSpan[] = [];
-  const needle = phrase.toLowerCase();
-  const hay = text.toLowerCase();
-  let idx = 0;
-  let count = 0;
-
-  while (true) {
-    const found = hay.indexOf(needle, idx);
-    if (found === -1) break;
-    const start = found;
-    const end = found + phrase.length;
-    spans.push({ start, end, snippet: clampSnippet(text, start, end) });
-    idx = end;
-    count += 1;
-    if (count >= maxMatches) break;
-  }
-
-  return spans;
-}
-
-function generateDeAiReport(text: string): {
-  schema_version: 1;
-  counts: Record<string, number>;
-  flags: DeAiFlag[];
-  suggested_ops: DeAiEditOp[];
-} {
-  const flags: DeAiFlag[] = [];
-  const suggested_ops: DeAiEditOp[] = [];
-
-  // A) rhetorical flourish: “didn’t just X — it Y”
-  const flourishRe = /\b(?:didn’t|didn't)\s+just\b[^—\n]{0,140}—\s*it\b/gi;
-  const flourishSpans = spansForRegex(text, flourishRe);
-  if (flourishSpans.length > 0) {
-    flags.push({
-      kind: "rhetorical_frame",
-      severity: "warn",
-      message: 'Rhetorical flourish detected ("didn’t just…—it…"). Convert to literal, direct statements.',
-      spans: flourishSpans
-    });
-  }
-
-  // B) filter phrasing: “you could taste/feel/hear/see …”
-  const filterRe = /\byou could (?:taste|feel|hear|see)\b/gi;
-  const filterSpans = spansForRegex(text, filterRe);
-  if (filterSpans.length > 0) {
-    flags.push({
-      kind: "rhetorical_frame",
-      severity: "warn",
-      message: 'Filter phrase detected ("you could ..."). Prefer direct sensory statements without the filter.',
-      spans: filterSpans
-    });
-  }
-
-  // C) personification: “the/a/an <noun> <human-ish verb>”
-  const personificationRe = new RegExp(
-    String.raw`\b(?:the|a|an)\s+[a-z][\w-]*(?:\s+[a-z][\w-]*){0,2}\s+(?:${PERSONIFICATION_VERBS
-      .map(escapeRe)
-      .join("|")})\b`,
-    "gi"
-  );
-  const personSpans = spansForRegex(text, personificationRe);
-  if (personSpans.length > 0) {
-    flags.push({
-      kind: "personification",
-      severity: "warn",
-      message:
-        "Personification detected. Replace with literal physical behavior rather than giving objects human intent or speech.",
-      spans: personSpans
-    });
-  }
-
-  // D) anthropomorphic sound nouns (“wet sigh”, “a whisper”, etc.)
-  const soundNounRe = new RegExp(
-    String.raw`\b(?:${ANTHRO_SOUND_ADJ.map(escapeRe).join("|")})\s+(?:${ANTHRO_SOUND_NOUNS
-      .map(escapeRe)
-      .join("|")})\b|\b(?:a|an)\s+(?:${ANTHRO_SOUND_NOUNS.map(escapeRe).join("|")})\b`,
-    "gi"
-  );
-  const soundSpans = spansForRegex(text, soundNounRe);
-  if (soundSpans.length > 0) {
-    flags.push({
-      kind: "personification",
-      severity: "warn",
-      message:
-        'Anthropomorphic sound noun detected (e.g., "sigh", "gasp", "whisper"). Replace with neutral sound terms unless the subject is a person.',
-      spans: soundSpans
-    });
-
-    // conservative replacements (limited)
-    for (const sp of soundSpans.slice(0, 25)) {
-      const lower = sp.snippet.toLowerCase();
-      if (lower.includes("whisper")) {
-        suggested_ops.push({
-          op: "replace",
-          span: sp,
-          replacement: sp.snippet.replace(/whisper/gi, "trace"),
-          note: 'Replace anthropomorphic noun "whisper" with "trace"'
-        });
-      } else {
-        suggested_ops.push({
-          op: "replace",
-          span: sp,
-          replacement: sp.snippet.replace(/gasp|groan|sigh|mutter|moan/gi, "sound"),
-          note: "Replace anthropomorphic sound noun with neutral 'sound'"
-        });
-      }
-    }
-  }
-
-  // E) “whisper of …” construction
-  const whisperOfSpans = phraseSpans(text, "whisper of");
-  if (whisperOfSpans.length > 0) {
-    flags.push({
-      kind: "personification",
-      severity: "warn",
-      message:
-        'Phrase "whisper of" detected. Prefer concrete quantity words (trace, hint, smear) tied to a physical source.',
-      spans: whisperOfSpans
-    });
-
-    for (const sp of whisperOfSpans.slice(0, 20)) {
-      suggested_ops.push({
-        op: "replace",
-        span: sp,
-        replacement: sp.snippet.replace(/whisper of/gi, "trace of"),
-        note: 'Replace "whisper of" with "trace of"'
-      });
-    }
-  }
-
-  // F) vague language
-  const vagueSpans: TextSpan[] = [];
-  for (const w of VAGUE_WORDS) {
-    const re = new RegExp(String.raw`\b${escapeRe(w)}\b`, "gi");
-    vagueSpans.push(...spansForRegex(text, re));
-  }
-  if (vagueSpans.length > 0) {
-    flags.push({
-      kind: "vague_language",
-      severity: "warn",
-      message: "Vague language detected. Replace with specific nouns/verbs or remove if it adds no meaning.",
-      spans: vagueSpans.slice(0, 80)
-    });
-  }
-
-  // G) abstract similes: “like sin/fate/…”
-  const abstractSimileRe = new RegExp(
-    String.raw`\blike\s+(?:${ABSTRACT_SIMILE_TARGETS.map(escapeRe).join("|")})\b`,
-    "gi"
-  );
-  const absSpans = spansForRegex(text, abstractSimileRe);
-  if (absSpans.length > 0) {
-    flags.push({
-      kind: "abstract_simile",
-      severity: "warn",
-      message:
-        "Abstract simile detected. Replace with a concrete comparison anchored to the POV character’s world.",
-      spans: absSpans
-    });
-  }
-
-  // H) moralizing taglines: “enough to damn you”
-  const moralizingRe = new RegExp(
-    String.raw`\benough\s+to\s+(?:${MORALIZING_TAGLINES.map(escapeRe).join("|")})\b`,
-    "gi"
-  );
-  const moralSpans = spansForRegex(text, moralizingRe);
-  if (moralSpans.length > 0) {
-    flags.push({
-      kind: "abstract_simile",
-      severity: "warn",
-      message:
-        'Moralizing tagline detected (e.g., "enough to damn you"). Replace with literal consequence (risk, cost, effect).',
-      spans: moralSpans
-    });
-  }
-
-  // I) banned phrases / clichés
-  const clicheSpans: TextSpan[] = [];
-  for (const p of BANNED_PHRASES) clicheSpans.push(...phraseSpans(text, p));
-  if (clicheSpans.length > 0) {
-    flags.push({
-      kind: "cliche",
-      severity: "error",
-      message: "Cliché phrase detected. Remove or replace with specific, original detail.",
-      spans: clicheSpans
-    });
-    for (const sp of clicheSpans.slice(0, 20)) {
-      suggested_ops.push({ op: "delete", span: sp, replacement: null, note: "Remove cliché phrase" });
-    }
-  }
-
-  // J) filler words
-  const fillerTargets = ["very", "really", "just", "somehow"];
-  const fillerSpans: TextSpan[] = [];
-  for (const w of fillerTargets) {
-    const re = new RegExp(String.raw`\b${escapeRe(w)}\b`, "gi");
-    fillerSpans.push(...spansForRegex(text, re));
-  }
-  if (fillerSpans.length > 0) {
-    flags.push({
-      kind: "filler",
-      severity: "info",
-      message: "Filler detected. Remove unless it changes literal meaning.",
-      spans: fillerSpans.slice(0, 80)
-    });
-    for (const sp of fillerSpans.slice(0, 40)) {
-      suggested_ops.push({ op: "delete", span: sp, replacement: null, note: "Remove filler word" });
-    }
-  }
-
-  const counts: Record<string, number> = {
-    personification: personSpans.length + soundSpans.length + whisperOfSpans.length,
-    vague_language: vagueSpans.length,
-    abstract_simile: absSpans.length + moralSpans.length,
-    cliche: clicheSpans.length,
-    rhetorical_frame: flourishSpans.length + filterSpans.length,
-    filler: fillerSpans.length
-  };
-
-  return { schema_version: 1, counts, flags, suggested_ops };
-}
-
-function applySafeDeAiOps(text: string, ops: DeAiEditOp[]): { text: string; applied: DeAiEditOp[] } {
-  // Conservative: apply deletes + only the limited replacements we generated.
-  const safe = ops.slice(0, 140);
-  const sorted = safe.slice().sort((a, b) => b.span.start - a.span.start);
-
-  let out = text;
-  const applied: DeAiEditOp[] = [];
-
-  for (const op of sorted) {
-    if (op.op === "delete") {
-      out = out.slice(0, op.span.start) + out.slice(op.span.end);
-      applied.push(op);
-      continue;
-    }
-
-    if (op.op === "replace" && typeof op.replacement === "string") {
-      out = out.slice(0, op.span.start) + op.replacement + out.slice(op.span.end);
-      applied.push(op);
-      continue;
-    }
-  }
-
-  return { text: out, applied };
-}
-
-/* -----------------------------
-   Core helpers
+   Errors / helpers
 ------------------------------ */
 
 function badRequest(message: string): never {
@@ -468,12 +102,27 @@ function nonEmptyQueryString(value: unknown, fallback: string): string {
   return trimmed.length > 0 ? trimmed : fallback;
 }
 
+function toArtifactRecord(latest: {
+  type: string;
+  name: string;
+  schema_version: number;
+  revision: number;
+  payload: unknown;
+}) {
+  return {
+    type: latest.type,
+    name: latest.name,
+    schema_version: latest.schema_version,
+    revision_number: latest.revision,
+    payload: latest.payload
+  };
+}
+
 async function ensureDefaultStyleProfile(projectId: string): Promise<void> {
   const existing = await prisma.artifact.findFirst({
     where: { projectId, type: "style_profile", name: DEFAULT_STYLE_PROFILE_NAME },
     select: { id: true }
   });
-
   if (existing) return;
 
   try {
@@ -503,11 +152,276 @@ async function getOrCreateDefaultProjectId(): Promise<string> {
 }
 
 /* -----------------------------
+   Deterministic De-AI scan
+------------------------------ */
+
+type DeAiSeverity = "info" | "warn" | "error";
+type DeAiFlagKind =
+  | "personification"
+  | "vague_language"
+  | "abstract_simile"
+  | "cliche"
+  | "rhetorical_frame"
+  | "filler";
+
+type TextSpan = { start: number; end: number; snippet: string };
+
+type DeAiFlag = {
+  kind: DeAiFlagKind;
+  severity: DeAiSeverity;
+  message: string;
+  spans: TextSpan[];
+};
+
+type DeAiEditOp = {
+  op: "delete" | "replace";
+  span: TextSpan;
+  replacement: string | null;
+  note: string;
+};
+
+const DeAiEditsRequestSchema = z.object({
+  schema_version: z.number().int().min(1),
+  text: z.string().min(1).max(200000),
+  apply: z.boolean().optional()
+});
+
+const PERSONIFICATION_VERBS = [
+  "begged",
+  "pleaded",
+  "whispered",
+  "muttered",
+  "groaned",
+  "sighed",
+  "gasped",
+  "moaned",
+  "laughed",
+  "sang",
+  "clung",
+  "gripped",
+  "held",
+  "grabbed",
+  "swallowed",
+  "claimed",
+  "answered",
+  "breathed",
+  "breathing",
+  "pressed",
+  "hung"
+];
+
+const VAGUE_WORDS = [
+  "somehow",
+  "suddenly",
+  "really",
+  "very",
+  "just",
+  "kind of",
+  "sort of",
+  "thing",
+  "stuff",
+  "wrong",
+  "strange",
+  "beautiful"
+];
+
+const BANNED_PHRASES = [
+  "like a dream",
+  "like a nightmare",
+  "time stood still",
+  "in the blink of an eye",
+  "cold as ice",
+  "silence was deafening",
+  "rotten at the core"
+];
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function clampSnippet(text: string, start: number, end: number): string {
+  const s = Math.max(0, start);
+  const e = Math.min(text.length, end);
+  return text.slice(s, e);
+}
+
+function spansForRegex(text: string, re: RegExp, maxMatches = 80): TextSpan[] {
+  const spans: TextSpan[] = [];
+  const global = re.global ? re : new RegExp(re.source, re.flags + "g");
+  let count = 0;
+
+  for (const m of text.matchAll(global)) {
+    const idx = m.index;
+    if (idx === undefined) continue;
+    const start = idx;
+    const end = start + m[0].length;
+    spans.push({ start, end, snippet: clampSnippet(text, start, end) });
+    count += 1;
+    if (count >= maxMatches) break;
+  }
+
+  return spans;
+}
+
+function phraseSpans(text: string, phrase: string, maxMatches = 60): TextSpan[] {
+  const spans: TextSpan[] = [];
+  const needle = phrase.toLowerCase();
+  const hay = text.toLowerCase();
+  let idx = 0;
+  let count = 0;
+
+  while (true) {
+    const found = hay.indexOf(needle, idx);
+    if (found === -1) break;
+    const start = found;
+    const end = found + phrase.length;
+    spans.push({ start, end, snippet: clampSnippet(text, start, end) });
+    idx = end;
+    count += 1;
+    if (count >= maxMatches) break;
+  }
+
+  return spans;
+}
+
+function generateDeAiReport(text: string): {
+  schema_version: 1;
+  counts: Record<string, number>;
+  flags: DeAiFlag[];
+  suggested_ops: DeAiEditOp[];
+} {
+  const flags: DeAiFlag[] = [];
+  const suggested_ops: DeAiEditOp[] = [];
+
+  // “didn’t just … — it …”
+  const flourishRe = /\b(?:didn’t|didn't)\s+just\b[^—\n]{0,140}—\s*it\b/gi;
+  const flourishSpans = spansForRegex(text, flourishRe);
+  if (flourishSpans.length > 0) {
+    flags.push({
+      kind: "rhetorical_frame",
+      severity: "warn",
+      message: 'Rhetorical flourish detected ("didn’t just…—it…"). Consider rewriting as literal statements.',
+      spans: flourishSpans
+    });
+  }
+
+  // “you could taste/feel/hear/see”
+  const filterRe = /\byou could (?:taste|feel|hear|see)\b/gi;
+  const filterSpans = spansForRegex(text, filterRe);
+  if (filterSpans.length > 0) {
+    flags.push({
+      kind: "rhetorical_frame",
+      severity: "warn",
+      message: 'Filter phrase detected ("you could ..."). Prefer direct sensory statements.',
+      spans: filterSpans
+    });
+  }
+
+  // crude personification detector
+  const personificationRe = new RegExp(
+    String.raw`\b(?:the|a|an)\s+[a-z][\w-]*(?:\s+[a-z][\w-]*){0,2}\s+(?:${PERSONIFICATION_VERBS
+      .map(escapeRe)
+      .join("|")})\b`,
+    "gi"
+  );
+  const personSpans = spansForRegex(text, personificationRe);
+  if (personSpans.length > 0) {
+    flags.push({
+      kind: "personification",
+      severity: "warn",
+      message: "Personification detected. Prefer literal physical behavior over implied intent.",
+      spans: personSpans
+    });
+  }
+
+  // vague language
+  const vagueSpans: TextSpan[] = [];
+  for (const w of VAGUE_WORDS) {
+    const re = new RegExp(String.raw`\b${escapeRe(w)}\b`, "gi");
+    vagueSpans.push(...spansForRegex(text, re));
+  }
+  if (vagueSpans.length > 0) {
+    flags.push({
+      kind: "vague_language",
+      severity: "warn",
+      message: "Vague language detected. Replace with specific nouns/verbs or remove.",
+      spans: vagueSpans.slice(0, 80)
+    });
+  }
+
+  // banned phrases / clichés
+  const clicheSpans: TextSpan[] = [];
+  for (const p of BANNED_PHRASES) clicheSpans.push(...phraseSpans(text, p));
+  if (clicheSpans.length > 0) {
+    flags.push({
+      kind: "cliche",
+      severity: "error",
+      message: "Cliché phrase detected. Remove or replace with specific detail.",
+      spans: clicheSpans
+    });
+    for (const sp of clicheSpans.slice(0, 20)) {
+      suggested_ops.push({ op: "delete", span: sp, replacement: null, note: "Remove cliché phrase" });
+    }
+  }
+
+  const fillerTargets = ["very", "really", "just", "somehow"];
+  const fillerSpans: TextSpan[] = [];
+  for (const w of fillerTargets) {
+    const re = new RegExp(String.raw`\b${escapeRe(w)}\b`, "gi");
+    fillerSpans.push(...spansForRegex(text, re));
+  }
+  if (fillerSpans.length > 0) {
+    flags.push({
+      kind: "filler",
+      severity: "info",
+      message: "Filler detected. Remove unless it changes literal meaning.",
+      spans: fillerSpans.slice(0, 80)
+    });
+    for (const sp of fillerSpans.slice(0, 40)) {
+      suggested_ops.push({ op: "delete", span: sp, replacement: null, note: "Remove filler word" });
+    }
+  }
+
+  const counts: Record<string, number> = {
+    rhetorical_frame: flourishSpans.length + filterSpans.length,
+    personification: personSpans.length,
+    vague_language: vagueSpans.length,
+    cliche: clicheSpans.length,
+    filler: fillerSpans.length
+  };
+
+  return { schema_version: 1, counts, flags, suggested_ops };
+}
+
+function applySafeDeAiOps(text: string, ops: DeAiEditOp[]): { text: string; applied: DeAiEditOp[] } {
+  const safe = ops.slice(0, 140);
+  const sorted = safe.slice().sort((a, b) => b.span.start - a.span.start);
+
+  let out = text;
+  const applied: DeAiEditOp[] = [];
+
+  for (const op of sorted) {
+    if (op.op === "delete") {
+      out = out.slice(0, op.span.start) + out.slice(op.span.end);
+      applied.push(op);
+      continue;
+    }
+    if (op.op === "replace" && typeof op.replacement === "string") {
+      out = out.slice(0, op.span.start) + op.replacement + out.slice(op.span.end);
+      applied.push(op);
+      continue;
+    }
+  }
+
+  return { text: out, applied };
+}
+
+/* -----------------------------
    Routes
 ------------------------------ */
 
 export async function registerRoutes(app: FastifyInstance) {
-  // Deterministic error responses
+  // deterministic errors (small payloads)
   app.setErrorHandler((error, _req, reply) => {
     const status = (error as any).statusCode ?? 500;
     reply.code(status).send({
@@ -529,13 +443,12 @@ export async function registerRoutes(app: FastifyInstance) {
       reply.code(404).type("application/json").send({ error: "not_found" });
       return;
     }
-    const yml = fs.readFileSync(p, "utf8");
-    reply.type("text/yaml").send(yml);
+    reply.type("text/yaml").send(fs.readFileSync(p, "utf8"));
   });
 
-  // -------------------------
-  // Default-project routes (NO projectId required)
-  // -------------------------
+  /* -------------------------
+     Default-project endpoints
+  -------------------------- */
 
   app.get("/v1/canon-digest", async () => {
     const projectId = await getOrCreateDefaultProjectId();
@@ -552,8 +465,18 @@ export async function registerRoutes(app: FastifyInstance) {
   app.get("/v1/artifacts", async (req) => {
     const projectId = await getOrCreateDefaultProjectId();
     const q = req.query as { type?: string };
+
     const type = q.type ? asArtifactType(q.type) : undefined;
-    return { artifacts: await listArtifacts(projectId, type) };
+    const artifacts = await listArtifacts(projectId, type);
+
+    return {
+      artifacts: artifacts.map((a) => ({
+        type: a.type,
+        name: a.name,
+        schema_version: a.schema_version,
+        updated_at: a.updated_at
+      }))
+    };
   });
 
   app.put("/v1/artifacts/:type/:name", async (req) => {
@@ -564,15 +487,20 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const parsedBody = ArtifactUpsertSchema.safeParse(req.body);
     if (!parsedBody.success) badRequest("Invalid artifact upsert body");
+
     const body = parsedBody.data;
 
-    return upsertArtifact({
+    await upsertArtifact({
       projectId,
       type: artifactType,
       name,
       schemaVersion: body.schema_version,
       payload: body.payload
     });
+
+    const latest = await getArtifactLatest({ projectId, type: artifactType, name });
+    if (!latest) return { error: "not_found" };
+    return toArtifactRecord(latest);
   });
 
   app.get("/v1/artifacts/:type/:name", async (req) => {
@@ -580,10 +508,10 @@ export async function registerRoutes(app: FastifyInstance) {
     const { type, name } = req.params as { type: string; name: string };
 
     const artifactType = asArtifactType(type);
-
     const latest = await getArtifactLatest({ projectId, type: artifactType, name });
     if (!latest) return { error: "not_found" };
-    return latest;
+
+    return toArtifactRecord(latest);
   });
 
   app.get("/v1/artifacts/:type/:name/revisions", async (req) => {
@@ -594,7 +522,10 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const list = await listArtifactRevisions({ projectId, type: artifactType, name });
     if (!list) return { error: "not_found" };
-    return { revisions: list };
+
+    return {
+      revisions: list.map((r) => ({ revision_number: r.revision, created_at: r.created_at }))
+    };
   });
 
   app.get("/v1/artifacts/:type/:name/revisions/:revision", async (req) => {
@@ -614,7 +545,15 @@ export async function registerRoutes(app: FastifyInstance) {
     });
 
     if (!item) return { error: "not_found" };
-    return item;
+
+    return {
+      type: item.type,
+      name: item.name,
+      schema_version: item.schema_version,
+      revision_number: item.revision,
+      created_at: new Date().toISOString(),
+      payload: item.payload
+    };
   });
 
   app.put("/v1/style-profiles/:profileName", async (req) => {
@@ -623,15 +562,18 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const parsed = StyleProfileSchema.safeParse(req.body);
     if (!parsed.success) badRequest("Invalid style profile");
-    const data = parsed.data;
 
-    return upsertArtifact({
+    await upsertArtifact({
       projectId,
       type: "style_profile",
       name: profileName,
-      schemaVersion: data.schema_version,
-      payload: data
+      schemaVersion: parsed.data.schema_version,
+      payload: parsed.data
     });
+
+    const latest = await getArtifactLatest({ projectId, type: "style_profile", name: profileName });
+    if (!latest) return { error: "not_found" };
+    return toArtifactRecord(latest);
   });
 
   app.get("/v1/style-profiles/:profileName", async (req) => {
@@ -640,7 +582,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const latest = await getArtifactLatest({ projectId, type: "style_profile", name: profileName });
     if (!latest) return { error: "not_found" };
-    return latest;
+    return toArtifactRecord(latest);
   });
 
   app.put("/v1/character-sheets/:sheetName", async (req) => {
@@ -649,15 +591,18 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const parsed = CharacterSheetSchema.safeParse(req.body);
     if (!parsed.success) badRequest("Invalid character sheet");
-    const data = parsed.data;
 
-    return upsertArtifact({
+    await upsertArtifact({
       projectId,
       type: "character_sheet",
       name: sheetName,
-      schemaVersion: data.schema_version,
-      payload: data
+      schemaVersion: parsed.data.schema_version,
+      payload: parsed.data
     });
+
+    const latest = await getArtifactLatest({ projectId, type: "character_sheet", name: sheetName });
+    if (!latest) return { error: "not_found" };
+    return toArtifactRecord(latest);
   });
 
   app.get("/v1/character-sheets/:sheetName", async (req) => {
@@ -666,7 +611,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const latest = await getArtifactLatest({ projectId, type: "character_sheet", name: sheetName });
     if (!latest) return { error: "not_found" };
-    return latest;
+    return toArtifactRecord(latest);
   });
 
   app.post("/v1/draft-directives", async (req) => {
@@ -677,15 +622,18 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const parsed = DraftDirectiveSchema.safeParse(req.body);
     if (!parsed.success) badRequest("Invalid draft directive");
-    const data = parsed.data;
 
-    return upsertArtifact({
+    await upsertArtifact({
       projectId,
       type: "draft_directive",
       name: directiveName,
-      schemaVersion: data.schema_version,
-      payload: data
+      schemaVersion: parsed.data.schema_version,
+      payload: parsed.data
     });
+
+    const latest = await getArtifactLatest({ projectId, type: "draft_directive", name: directiveName });
+    if (!latest) return { error: "not_found" };
+    return toArtifactRecord(latest);
   });
 
   app.post("/v1/revision-plans", async (req) => {
@@ -696,9 +644,8 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const parsed = RevisionPlanRequestSchema.safeParse(req.body);
     if (!parsed.success) badRequest("Invalid revision plan request");
-    const reqData = parsed.data;
 
-    const mode = reqData.mode;
+    const mode = parsed.data.mode;
 
     const rubricBase: string[] = [
       "Clarity beats beauty; rewrite anything that is pretty but unclear",
@@ -752,7 +699,7 @@ export async function registerRoutes(app: FastifyInstance) {
     };
 
     const planCandidate = {
-      schema_version: reqData.schema_version,
+      schema_version: parsed.data.schema_version,
       mode,
       rubric: [...rubricBase, ...(modeRubric[mode] ?? [])],
       risks_to_avoid: [
@@ -768,13 +715,17 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const plan = RevisionPlanSchema.parse(planCandidate);
 
-    return upsertArtifact({
+    await upsertArtifact({
       projectId,
       type: "revision_plan",
       name: planName,
       schemaVersion: plan.schema_version,
       payload: plan
     });
+
+    const latest = await getArtifactLatest({ projectId, type: "revision_plan", name: planName });
+    if (!latest) return { error: "not_found" };
+    return toArtifactRecord(latest);
   });
 
   app.post("/v1/diagnostics/prose", async (req) => {
@@ -782,8 +733,8 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const parsed = ProseDiagnosticRequestSchema.safeParse(req.body);
     if (!parsed.success) badRequest("Invalid diagnostic request");
-    const data = parsed.data;
 
+    const data = parsed.data;
     const analysis = analyzeProse(data.text);
 
     const issues: Array<{
@@ -810,7 +761,7 @@ export async function registerRoutes(app: FastifyInstance) {
       issues.push({
         severity: "warn",
         category: "filler",
-        message: "Filler detected; cut throat-clearing and replace generic reactions with specific action"
+        message: "Filler detected; cut throat-clearing and replace generic phrasing with specific action"
       });
     }
 
@@ -841,20 +792,17 @@ export async function registerRoutes(app: FastifyInstance) {
       }
     };
 
-    return upsertArtifact({
+    await upsertArtifact({
       projectId,
       type: "quality_report",
       name: "latest",
       schemaVersion: report.schema_version,
       payload: report
     });
-  });
 
-  // Deterministic de-AI edit report (and optional conservative auto-clean)
-  const DeAiEditsRequestSchema = z.object({
-    schema_version: z.number().int().min(1),
-    text: z.string().min(1).max(200000),
-    apply: z.boolean().optional()
+    const latest = await getArtifactLatest({ projectId, type: "quality_report", name: "latest" });
+    if (!latest) return { error: "not_found" };
+    return toArtifactRecord(latest);
   });
 
   app.post("/v1/edits/deai", async (req) => {
@@ -862,6 +810,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const parsed = DeAiEditsRequestSchema.safeParse(req.body);
     if (!parsed.success) badRequest("Invalid de-AI edit request");
+
     const data = parsed.data;
 
     const report = generateDeAiReport(data.text);
@@ -876,7 +825,7 @@ export async function registerRoutes(app: FastifyInstance) {
     }
 
     const response = {
-      schema_version: 1 as const,
+      schema_version: 1,
       counts: report.counts,
       flags: report.flags,
       applied_ops,
@@ -894,17 +843,16 @@ export async function registerRoutes(app: FastifyInstance) {
     return response;
   });
 
-  // -------------------------
-  // Optional multi-project routes
-  // -------------------------
+  /* -------------------------
+     Optional multi-project routes
+  -------------------------- */
 
   app.post("/v1/projects", async (req) => {
     const parsed = ProjectCreateSchema.safeParse(req.body ?? {});
     if (!parsed.success) badRequest("Invalid project request");
-    const data = parsed.data;
 
     const created = await prisma.project.create({
-      data: { name: data.name ?? null }
+      data: { name: parsed.data.name ?? null }
     });
 
     return { project_id: created.id };
